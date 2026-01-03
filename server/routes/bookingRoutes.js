@@ -32,7 +32,9 @@ const {
   updateCommissionAmount,
   getCustomerCreditNotes,
   getAttentionBookings,
-  getOverdueBookings
+  getOverdueBookings,
+  writeOffBookingBalance,
+  reverseAmendment
 } = require('../controllers/bookingController');
 
 
@@ -71,6 +73,7 @@ router.put('/:id/commission-amount', authenticateToken, authorizeRole(['ADMIN', 
 
 router.get('/credit-notes/customer', authenticateToken, authorizeRole(['CONSULTANT','MANAGEMENT','ADMIN', 'SUPER_ADMIN']), getCustomerCreditNotes);
 
-
+router.post('/:id/write-off', authenticateToken, writeOffBookingBalance);
+router.post('/amendments/:amendmentId/reverse', authenticateToken, reverseAmendment);
 
 module.exports = router;

@@ -3,7 +3,8 @@ import { getCustomerDeposits, generateCustomerDepositReportPDF, recordSettlement
 import InstalmentPaymentPopup from './InstalmentPaymentPopup';
 import FinalSettlementPopup from './FinalSettlementPopup';
 import PaymentHistoryPopup from './PaymentHistoryPopup';
-import { FaSearch, FaExclamationCircle, FaCheckCircle, FaBan, FaMoneyBillWave, FaHandHoldingUsd, FaReceipt, FaDownload, FaSpinner, FaInfoCircle } from 'react-icons/fa';
+import WriteOffBalancePopup from './WriteOffBalancePopup'; // NEW IMPORT
+import { FaSearch, FaExclamationCircle, FaCheckCircle, FaBan, FaMoneyBillWave, FaHandHoldingUsd, FaReceipt, FaDownload, FaSpinner, FaEraser } from 'react-icons/fa';
 import SettleCustomerPayablePopup from '../components/SettleCustomerPayablePopup';
 import RecordRefundPopup from '../components/RecordRefundPopup';
 
@@ -13,6 +14,7 @@ const ActionButton = ({ onClick, icon, children, color = 'blue' }) => {
         red: 'bg-red-600 hover:bg-red-700 text-white',
         green: 'bg-green-600 hover:bg-green-700 text-white',
         yellow: 'bg-yellow-500 hover:bg-yellow-600 text-white',
+        orange: 'bg-orange-600 hover:bg-orange-700 text-white', // Added orange
     };
     return (
         <button
@@ -24,6 +26,7 @@ const ActionButton = ({ onClick, icon, children, color = 'blue' }) => {
         </button>
     );
 };
+
 const StatusBadge = ({ children, color = 'gray' }) => {
     const colorClasses = {
         gray: 'bg-gray-100 text-gray-700',
@@ -40,48 +43,66 @@ const StatusBadge = ({ children, color = 'gray' }) => {
 };
 
 const getActionStatus = (booking) => {
+    // 1. Check Cancellation Status first
     if (booking.bookingStatus === 'CANCELLED') {
         const cancellation = booking.cancellation;
         if (cancellation?.createdCustomerPayable?.pendingAmount > 0) return 'CUSTOMER_OWES';
         if (cancellation?.refundStatus === 'PAID') return 'REFUND_PAID';
-        if (cancellation?.generatedCustomerCreditNote) {
-            const creditNote = cancellation.generatedCustomerCreditNote;
-            if (creditNote.status === 'USED') return 'CREDIT_USED';
-            if (creditNote.status === 'PARTIALLY_USED') return 'CREDIT_PARTIAL';
-            if (creditNote.status === 'AVAILABLE') return 'CREDIT_AVAILABLE';
-        }
         if (cancellation?.refundStatus === 'PENDING') return 'REFUND_PENDING';
         return 'CANCELLED_SETTLED';
     }
-    const balance = parseFloat(booking.balance);
-    if (balance > 0) {
-        const hasPendingInstalments = (booking.instalments || []).some(inst => ['PENDING', 'OVERDUE'].includes(inst.status));
-        return hasPendingInstalments ? 'INSTALMENT_DUE' : 'FINAL_SETTLEMENT_DUE';
+
+    // 2. Handle the Write-Off / Completed Logic
+    const balance = parseFloat(booking.balance || 0);
+
+    // If balance is basically zero, it's COMPLETED. No buttons should show.
+    if (Math.abs(balance) < 0.01) {
+        return 'COMPLETED';
     }
-    if (balance < 0) return 'OVERPAID';
+
+    // 3. Handle Active Debits/Credits
+    if (balance > 0.01) {
+        const hasPending = (booking.instalments || []).some(
+            inst => ['PENDING', 'OVERDUE'].includes(inst.status)
+        );
+        return hasPending ? 'INSTALMENT_DUE' : 'FINAL_SETTLEMENT_DUE';
+    }
+
+    if (balance < -0.01) return 'OVERPAID';
+
     return 'COMPLETED';
 };
-
 
 const ActionCell = ({ booking, onAction, expanded, onToggleExpand }) => {
     const status = getActionStatus(booking);
     const permissions = booking._permissions || { canSettlePayments: false };
 
+    // 1. If the booking is completed, show the badge and STOP.
+    if (status === 'COMPLETED') {
+        return <StatusBadge color="green"><FaCheckCircle /> Completed</StatusBadge>;
+    }
+
+    // Helper for Write-off link
+    const WriteOffButton = () => (
+        <button 
+            onClick={() => onAction('writeOff', booking)}
+            className="text-[10px] text-gray-400 hover:text-orange-600 underline font-medium block mx-auto mt-1"
+        >
+            Write-off Balance
+        </button>
+    );
+
+    // 2. Permission Check
     if (!permissions.canSettlePayments) {
         switch (status) {
-            case 'CUSTOMER_OWES':
-                return <StatusBadge color="red"><FaExclamationCircle /> Debt Pending</StatusBadge>;
-            case 'REFUND_PENDING':
-            case 'CREDIT_AVAILABLE':
-            case 'CREDIT_PARTIAL':
-                return <StatusBadge color="blue"><FaReceipt /> Refund Pending</StatusBadge>;
-            case 'FINAL_SETTLEMENT_DUE':
-                return <StatusBadge color="yellow"><FaExclamationCircle /> Balance Due</StatusBadge>;
-            case 'INSTALMENT_DUE':
-                return <StatusBadge color="gray"><FaMoneyBillWave /> Instalment Due</StatusBadge>;
+            case 'CUSTOMER_OWES': return <StatusBadge color="red"><FaExclamationCircle /> Debt Pending</StatusBadge>;
+            case 'FINAL_SETTLEMENT_DUE': return <StatusBadge color="yellow"><FaExclamationCircle /> Balance Due</StatusBadge>;
+            case 'INSTALMENT_DUE': return <StatusBadge color="gray"><FaMoneyBillWave /> Instalment Due</StatusBadge>;
+            default: return <StatusBadge color="green"><FaCheckCircle /> Completed</StatusBadge>;
         }
     }
 
+    // 3. Main Action Switch
     switch (status) {
         case 'CUSTOMER_OWES': {
             const payable = booking.cancellation.createdCustomerPayable;
@@ -91,55 +112,11 @@ const ActionCell = ({ booking, onAction, expanded, onToggleExpand }) => {
                         Settle Debt
                     </ActionButton>
                     <p className="text-xs text-red-600 font-medium">Owes: £{payable.pendingAmount.toFixed(2)}</p>
+                    <WriteOffButton />
                 </div>
             );
         }
 
-        case 'REFUND_PENDING':
-        case 'CREDIT_AVAILABLE':
-        case 'CREDIT_PARTIAL': {
-            const creditNote = booking.cancellation?.generatedCustomerCreditNote;
-            const isCreditIssued = (status === 'CREDIT_AVAILABLE' || status === 'CREDIT_PARTIAL') && creditNote;
-
-            let amountToRefund;
-            if (isCreditIssued) {
-                amountToRefund = parseFloat(creditNote.remainingAmount);
-            } else {
-                amountToRefund = parseFloat(booking.cancellation?.refundToPassenger || 0);
-            }
-
-            return (
-                <div className="text-center space-y-1">
-                    <ActionButton
-                        color="green"
-                        icon={<FaReceipt />}
-                        onClick={() => onAction('recordRefund', {
-                            cancellation: {
-                                ...booking.cancellation,
-                                refundToPassenger: amountToRefund
-                            },
-                            booking
-                        })}
-                    >
-                        Record Cash Refund
-                    </ActionButton>
-
-                    {isCreditIssued ? (
-                        <p className="text-xs text-blue-700 font-medium" title={`Note ID: ${creditNote.id}, Initial: £${creditNote.initialAmount.toFixed(2)}`}>
-                            Credit Avail: £{creditNote.remainingAmount.toFixed(2)}
-                        </p>
-                    ) : (
-                        <p className="text-xs text-orange-600 font-medium">Cash Refund Due: £{amountToRefund.toFixed(2)}</p>
-                    )}
-
-                    {isCreditIssued && <p className="text-xs text-gray-500">(Issuing cash will void remaining credit)</p>}
-                </div>
-            );
-        }
-
-        case 'REFUND_PAID': return <StatusBadge color="green"><FaCheckCircle /> Refund Paid</StatusBadge>;
-        case 'CREDIT_USED': return <StatusBadge color="purple"><FaCheckCircle /> Credit Used</StatusBadge>;
-        case 'CANCELLED_SETTLED': return <StatusBadge color="gray"><FaBan /> Cancelled</StatusBadge>;
         case 'FINAL_SETTLEMENT_DUE':
             return (
                 <div className="text-center space-y-1">
@@ -147,84 +124,70 @@ const ActionCell = ({ booking, onAction, expanded, onToggleExpand }) => {
                         Final Settlement
                     </ActionButton>
                     <p className="text-xs text-yellow-700 font-medium">Balance: £{parseFloat(booking.balance).toFixed(2)}</p>
+                    <WriteOffButton />
                 </div>
             );
 
         case 'INSTALMENT_DUE': {
-            const instalments = booking.instalments || [];
-            const nextInstalment = instalments.find(inst => ['PENDING', 'OVERDUE'].includes(inst.status));
-            
-            if (!nextInstalment) return <StatusBadge color="gray">Processing...</StatusBadge>;
+    const instalments = booking.instalments || [];
+    const nextInstalment = instalments.find(inst => ['PENDING', 'OVERDUE'].includes(inst.status));
+    
+    if (!nextInstalment && instalments.length === 0) return <StatusBadge color="gray">No instalments found</StatusBadge>;
 
-            if (!expanded) {
-                return (
-                    <div className="text-center space-y-1">
+    if (!expanded) {
+        return (
+            <div className="text-center space-y-1">
+                {nextInstalment && (
+                    <>
                         <ActionButton icon={<FaMoneyBillWave />} onClick={() => onAction('payInstalment', { instalment: nextInstalment, booking })}>
                             Pay Instalment
                         </ActionButton>
-                        <div className="text-xs text-gray-600">
-                            <p>Next: £{nextInstalment.amount.toFixed(2)}</p>
-                            <p className={nextInstalment.status === 'OVERDUE' ? 'text-red-600 font-semibold' : ''}>
-                                Due: {new Date(nextInstalment.dueDate).toLocaleDateString('en-GB')}
-                            </p>
-                        </div>
-                        {instalments.length > 1 && (
-                            <button onClick={onToggleExpand} className="text-blue-600 hover:underline text-xs font-medium mt-1">
-                                Show All ({instalments.length})
-                            </button>
-                        )}
-                    </div>
-                );
-            }
+                        <p className="text-xs text-gray-600">Next: £{nextInstalment.amount.toFixed(2)}</p>
+                    </>
+                )}
+                <WriteOffButton />
+                {instalments.length > 0 && (
+                    <button onClick={onToggleExpand} className="text-blue-600 hover:underline text-xs font-medium mt-1">
+                        Show All ({instalments.length})
+                    </button>
+                )}
+            </div>
+        );
+    }
 
+    return (
+        <div className="text-left space-y-2 p-2 bg-gray-50 rounded-lg w-full">
+            {instalments.map(inst => (
+                <div key={inst.id} className="flex justify-between items-center text-xs p-1.5 rounded bg-white shadow-sm">
+                    <div className="flex flex-col">
+                        <span className="font-semibold">£{parseFloat(inst.amount).toFixed(2)}</span>
+                        <span className="text-gray-500">Due: {new Date(inst.dueDate).toLocaleDateString('en-GB')}</span>
+                    </div>
+                    <StatusBadge color={inst.status === 'PAID' ? 'green' : (inst.status === 'OVERDUE' ? 'red' : 'gray')}>
+                        {inst.status}
+                    </StatusBadge>
+                </div>
+            ))}
+            <WriteOffButton />
+            <button onClick={onToggleExpand} className="text-blue-600 hover:underline text-xs font-medium mt-2 w-full text-center">
+                Collapse
+            </button>
+        </div>
+    );
+}
+
+        case 'OVERPAID':
             return (
-                <div className="text-left space-y-2 p-2 bg-gray-50 rounded-lg w-full">
-                    {instalments.map(inst => {
-                        const isNext = inst.id === nextInstalment.id;
-                        const isOverdue = inst.status === 'OVERDUE';
-                        const isPaid = inst.status === 'PAID';
-                        
-                        return (
-                            <div key={inst.id} className={`flex justify-between items-center text-xs p-1.5 rounded ${isNext ? 'bg-blue-100 ring-1 ring-blue-400' : ''} ${isPaid ? 'bg-green-50 opacity-70' : ''}`}>
-                                <div className="flex flex-col">
-                                    <span className={`font-semibold ${isOverdue ? 'text-red-600' : (isPaid ? 'text-green-700' : 'text-gray-700')}`}>
-                                        £{inst.amount.toFixed(2)}
-                                    </span>
-                                    <span className={isPaid ? 'text-gray-400' : 'text-gray-500'}>
-                                        Due: {new Date(inst.dueDate).toLocaleDateString('en-GB')}
-                                    </span>
-                                </div>
-                                {isPaid ? (
-                                    <StatusBadge color="green"><FaCheckCircle /> Paid</StatusBadge>
-                                ) : isNext ? (
-                                    <ActionButton 
-                                        icon={<FaMoneyBillWave />} 
-                                        onClick={() => onAction('payInstalment', { instalment: inst, booking })}
-                                    >
-                                        Pay
-                                    </ActionButton>
-                                ) : (
-                                    <StatusBadge color={isOverdue ? 'red' : 'gray'}>
-                                        {isOverdue ? 'Overdue' : 'Pending'}
-                                    </StatusBadge>
-                                )}
-                            </div>
-                        );
-                    })}
-                    {instalments.length > 1 && (
-                        <button onClick={onToggleExpand} className="text-blue-600 hover:underline text-xs font-medium mt-2 w-full text-center">
-                            Collapse
-                        </button>
-                    )}
+                <div className="text-center space-y-1">
+                    <StatusBadge color="blue"><FaCheckCircle /> Overpaid</StatusBadge>
+                    <WriteOffButton />
                 </div>
             );
-        }
 
-        case 'OVERPAID': return <StatusBadge color="blue"><FaCheckCircle /> Overpaid</StatusBadge>;
-        case 'COMPLETED': default: return <StatusBadge color="green"><FaCheckCircle /> Completed</StatusBadge>;
+        default:
+            return <StatusBadge color="green"><FaCheckCircle /> Completed</StatusBadge>;
     }
 };
-
 
 export default function CustomerDeposits() {
     const [bookings, setBookings] = useState([]);
@@ -232,6 +195,7 @@ export default function CustomerDeposits() {
     const [errorMessage, setErrorMessage] = useState('');
     const [paymentPopup, setPaymentPopup] = useState(null);
     const [settlementPopup, setSettlementPopup] = useState(null);
+    const [writeOffPopup, setWriteOffPopup] = useState(null); // NEW STATE
     const [expandedRows, setExpandedRows] = useState({});
     const [filter, setFilter] = useState('all');
     const [searchTerm, setSearchTerm] = useState('');
@@ -292,12 +256,16 @@ export default function CustomerDeposits() {
         setPaymentPopup(null);
     };
 
-    const handleActionCompletion = () => {
-        fetchBookings();
-        setSettlementPopup(null);
-        setCustomerPayablePopup(null);
-        setRecordRefundPopup(null);
-    };
+    const handleActionCompletion = async () => {
+    // 1. Re-fetch from server to get the NEW calculated balance
+    await fetchBookings(); 
+    
+    // 2. Close all popups
+    setSettlementPopup(null);
+    setCustomerPayablePopup(null);
+    setRecordRefundPopup(null);
+    setWriteOffPopup(null); 
+};
 
     const formatDate = (dateStr) => {
         if (!dateStr) return 'N/A';
@@ -345,6 +313,7 @@ export default function CustomerDeposits() {
             case 'recordRefund': setRecordRefundPopup(payload); break;
             case 'finalSettlement': setSettlementPopup(payload); break;
             case 'payInstalment': setPaymentPopup(payload); break;
+            case 'writeOff': setWriteOffPopup(payload); break; // NEW CASE
             default: console.warn('Unknown action type:', actionType);
         }
     };
@@ -363,23 +332,6 @@ export default function CustomerDeposits() {
                 <div className="text-center">
                     <FaSpinner className="animate-spin text-blue-600 h-12 w-12 mx-auto mb-4" />
                     <p className="text-lg font-semibold text-gray-700">Loading customer deposits...</p>
-                </div>
-            </div>
-        );
-    }
-
-    if (errorMessage) {
-        return (
-            <div className="flex items-center justify-center min-h-[400px] bg-white rounded-2xl shadow-lg">
-                <div className="text-center max-w-md p-6">
-                    <div className="text-red-500 mb-4">
-                        <FaExclamationCircle className="h-12 w-12 mx-auto" />
-                    </div>
-                    <h3 className="text-xl font-semibold text-gray-800 mb-2">Error Loading Data</h3>
-                    <p className="text-gray-600 mb-6">{errorMessage}</p>
-                    <button onClick={fetchBookings} className="px-6 py-3 bg-blue-600 text-white rounded-lg hover:bg-blue-700 transition-colors duration-200">
-                        Retry
-                    </button>
                 </div>
             </div>
         );
@@ -455,7 +407,6 @@ export default function CustomerDeposits() {
                                         <td className={`py-3 px-3 text-sm ${isCancelled ? 'text-gray-500' : 'text-gray-600'}`}>{booking.refNo}</td>
                                         <td className={`py-3 px-3 text-sm ${isCancelled ? 'text-gray-500' : 'text-gray-600'}`}>{booking.paxName}</td>
                                         <td className={`py-3 px-3 text-sm ${isCancelled ? 'text-gray-500' : 'text-gray-600'}`}>{booking.agentName}</td>
-
                                         <td className={`py-3 px-3 text-sm ${isCancelled ? 'text-gray-500' : 'text-gray-600'} whitespace-nowrap`}>
                                             {creditRefNo ? (
                                                 <div className="flex flex-col">
@@ -468,7 +419,6 @@ export default function CustomerDeposits() {
                                                 booking.paymentMethod
                                             )}
                                         </td>
-
                                         <td className={`py-3 px-3 text-sm font-medium ${isCancelled ? 'text-gray-500' : 'text-gray-800'}`}>{parseFloat(booking.revenue).toFixed(2)}</td>
                                         <td className={`py-3 px-3 text-sm ${isCancelled ? 'text-gray-500' : 'text-gray-600'}`}>{parseFloat(booking.initialDeposit || 0).toFixed(2)}</td>
                                         <td className={`py-3 px-3 text-sm font-medium ${isCancelled ? 'text-gray-500' : 'text-gray-800'}`}>{parseFloat(booking.received || 0).toFixed(2)}</td>
@@ -491,10 +441,21 @@ export default function CustomerDeposits() {
                 </div>
             )}
 
+            {/* POPUPS */}
             {paymentPopup && (<InstalmentPaymentPopup {...paymentPopup} onClose={() => setPaymentPopup(null)} onSubmit={handleSavePayment} />)}
-            {settlementPopup && (<FinalSettlementPopup booking={settlementPopup} onClose={() => setSettlementPopup(null)} onSubmit={handleSaveSettlement} />)}            {historyPopupBooking && (<PaymentHistoryPopup booking={historyPopupBooking} onClose={() => setHistoryPopupBooking(null)} />)}
+            {settlementPopup && (<FinalSettlementPopup booking={settlementPopup} onClose={() => setSettlementPopup(null)} onSubmit={handleSaveSettlement} />)}
+            {historyPopupBooking && (<PaymentHistoryPopup booking={historyPopupBooking} onClose={() => setHistoryPopupBooking(null)} />)}
             {customerPayablePopup && ( <SettleCustomerPayablePopup payable={customerPayablePopup.payable} booking={customerPayablePopup.booking} onClose={() => setCustomerPayablePopup(null)} onSubmit={handleActionCompletion} /> )}
             {recordRefundPopup && ( <RecordRefundPopup cancellation={recordRefundPopup.cancellation} booking={recordRefundPopup.booking} onClose={() => setRecordRefundPopup(null)} onSubmit={handleActionCompletion} /> )}
+            
+            {/* NEW WRITE OFF POPUP */}
+            {writeOffPopup && (
+                <WriteOffBalancePopup 
+                    booking={writeOffPopup} 
+                    onClose={() => setWriteOffPopup(null)} 
+                    onSubmit={handleActionCompletion} 
+                />
+            )}
         </div>
     );
 }
