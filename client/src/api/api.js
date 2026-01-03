@@ -470,3 +470,11 @@ export const getCustomerCreditNotes = async (originalBookingId) => {
     params: { originalBookingId } // Changed parameter name
   });
 };
+
+export const writeOffBookingBalance = async (bookingId, data) => {
+    return await api.post(`/bookings/${bookingId}/write-off`, data);
+};
+
+export const reverseAmendment = async (amendmentId) => {
+    return await api.post(`/bookings/amendments/${amendmentId}/reverse`);
+};

@@ -1069,7 +1069,6 @@ const getOverdueBookings = async (req, res) => {
   }
 };
 
-
 const getRecentBookings = async (req, res) => {
   try {
     const recentBookings = await prisma.booking.findMany({
@@ -1120,8 +1119,6 @@ const getRecentBookings = async (req, res) => {
     return apiResponse.error(res, 'Failed to fetch recent bookings: ' + error.message, 500);
   }
 };
-
-
 
 const updateInstalment = async (req, res) => {
   const { id: userId } = req.user;
@@ -1272,7 +1269,6 @@ const updateInstalment = async (req, res) => {
   }
 };
 
-
 const getCustomerDeposits = async (req, res) => {
   try {
     const { role, firstName, lastName } = req.user;
@@ -1344,6 +1340,17 @@ const getCustomerDeposits = async (req, res) => {
             },
           },
         },
+        amendments: {
+          where: { isReversed: false },
+          select: {
+            id: true,
+            difference: true,
+            type: true,
+            reason: true,
+            isReversed: true,
+            createdAt: true
+          }
+        },
         cancellation: {
           select: {
             id: true,
@@ -1410,19 +1417,25 @@ const getCustomerDeposits = async (req, res) => {
     });
 
     const formattedBookings = bookings.map((booking) => {
-      const revenue = parseFloat(booking.revenue || 0);
+  const revenue = parseFloat(booking.revenue || 0);
 
-      const sumOfInitialPayments = (booking.initialPayments || [])
-        .reduce((sum, p) => sum + parseFloat(p.amount || 0), 0);
+  const sumOfInitialPayments = (booking.initialPayments || [])
+    .reduce((sum, p) => sum + parseFloat(p.amount || 0), 0);
 
-      const sumOfPaidInstalments = (booking.instalments || [])
-        .reduce((sum, inst) => {
-          const paymentTotal = (inst.payments || []).reduce((pSum, p) => pSum + parseFloat(p.amount || 0), 0);
-          return sum + paymentTotal;
-        }, 0);
+  const sumOfPaidInstalments = (booking.instalments || [])
+    .reduce((sum, inst) => {
+      const paymentTotal = (inst.payments || []).reduce((pSum, p) => pSum + parseFloat(p.amount || 0), 0);
+      return sum + paymentTotal;
+    }, 0);
 
-      let totalReceived = sumOfInitialPayments + sumOfPaidInstalments;
-      let currentBalance = revenue - totalReceived;
+  // NEW: Sum up all active write-offs/adjustments
+  const totalAdjustments = (booking.amendments || [])
+    .reduce((sum, am) => sum + parseFloat(am.difference || 0), 0);
+
+  let totalReceived = sumOfInitialPayments + sumOfPaidInstalments;
+  
+  // FIX: Include totalAdjustments in the balance math
+  let currentBalance = revenue - totalReceived + totalAdjustments;
 
       const paymentHistory = [];
        (booking.initialPayments || []).forEach(payment => {
@@ -1517,16 +1530,29 @@ const getCustomerDeposits = async (req, res) => {
           .slice(0, 1)
           .reduce((sum, p) => sum + parseFloat(p.amount || 0), 0);
 
+      
+          (booking.amendments || []).forEach(am => {
+                paymentHistory.push({
+                    id: `amendment-${am.id}`,
+                    type: am.type === 'WRITE_OFF' ? 'Write-off' : 'Adjustment',
+                    date: am.createdAt,
+                    amount: parseFloat(am.difference || 0),
+                    method: 'ADMIN',
+                    details: am.isReversed ? `(REVERSED) ${am.reason}` : am.reason,
+                    isReversed: am.isReversed // Pass this flag to the UI
+                });
+            });
 
-      return {
-        ...booking,
-        revenue: revenue.toFixed(2),
-        received: totalReceived.toFixed(2),
-        balance: currentBalance.toFixed(2),
-        initialDeposit: sumOfInitialPayments.toFixed(2), 
-        paymentHistory: paymentHistory,
-        _permissions: permissions 
-      };
+
+          return {
+      ...booking, // This spreads the original booking, including the 'instalments' array
+      revenue: revenue.toFixed(2),
+      received: totalReceived.toFixed(2),
+      balance: currentBalance.toFixed(2),
+      initialDeposit: sumOfInitialPayments.toFixed(2), 
+      paymentHistory: paymentHistory,
+      _permissions: permissions 
+    };
     });
 
     return apiResponse.success(res, formattedBookings);
@@ -1888,7 +1914,6 @@ const getSuppliersInfo = async (req, res) => {
         );
     }
 };
-
 
 const updatePendingBooking = async (req, res) => {
   const { id: userId } = req.user;
@@ -2475,7 +2500,6 @@ const recordSettlementPayment = async (req, res) => {
   }
 };
 
-
 const getTransactions = async (req, res) => {
   try {
         const allInitialPayments = await prisma.initialPayment.findMany({
@@ -2669,10 +2693,6 @@ const getTransactions = async (req, res) => {
     return apiResponse.error(res, `Failed to fetch transactions: ${error.message}`, 500);
   }
 };
-
-
-
-
 
 const createCancellation = async (req, res) => {
   const { id: userId } = req.user;
@@ -4069,7 +4089,137 @@ const getCustomerCreditNotes = async (req, res) => {
     }
 };
 
+const writeOffBookingBalance = async (req, res) => {
+    const { id: userId } = req.user;
+    const bookingId = parseInt(req.params.id);
+    const { reason } = req.body;
 
+    try {
+        const result = await prisma.$transaction(async (tx) => {
+            // 1. Fetch current booking state
+            const booking = await tx.booking.findUnique({
+                where: { id: bookingId },
+                include: {
+                    initialPayments: true,
+                    instalments: { include: { payments: true } },
+                    customerPayables: { include: { settlements: true } },
+                    amendments: { where: { isReversed: false } } // Include active adjustments
+                }
+            });
+
+            if (!booking) throw new Error('Booking not found');
+            
+            const currentBalance = parseFloat(booking.balance || 0);
+            if (Math.abs(currentBalance) < 0.01) throw new Error('Balance is already zero');
+
+            // 2. Create the Amendment Record (The "Paper Trail")
+            const amendment = await tx.bookingAmendment.create({
+                data: {
+                    bookingId: booking.id,
+                    userId: userId,
+                    type: 'WRITE_OFF',
+                    propertyName: 'balance',
+                    oldValue: currentBalance,
+                    newValue: 0,
+                    difference: -currentBalance, // Negative for debt, positive for overpayment
+                    reason: reason,
+                    isReversed: false
+                }
+            });
+
+            // 3. Recalculate everything to ensure absolute accuracy
+            const totalInitial = (booking.initialPayments || []).reduce((sum, p) => sum + p.amount, 0);
+            const totalInstalments = (booking.instalments || []).reduce((sum, inst) => 
+                sum + (inst.payments || []).reduce((pSum, p) => pSum + p.amount, 0), 0);
+            const totalPayables = (booking.customerPayables || []).reduce((sum, cp) => 
+                sum + (cp.settlements || []).reduce((sSum, s) => sSum + s.amount, 0), 0);
+            
+            // Add existing amendments + the one we just created
+            const totalAdjustments = (booking.amendments || []).reduce((sum, am) => sum + am.difference, 0) + (-currentBalance);
+
+            const totalReceived = totalInitial + totalInstalments + totalPayables;
+            const newFinalBalance = (booking.revenue || 0) - totalReceived + totalAdjustments;
+
+            // 4. Update the Booking with the new math
+            const updatedBooking = await tx.booking.update({
+                where: { id: booking.id },
+                data: {
+                    balance: newFinalBalance,
+                    // If balance is zero, mark status as COMPLETED
+                    bookingStatus: Math.abs(newFinalBalance) < 0.01 ? 'COMPLETED' : booking.bookingStatus
+                }
+            });
+
+            return { updatedBooking, amendment };
+        }, { timeout: 10000 });
+
+        return apiResponse.success(res, result);
+    } catch (error) {
+        console.error('Write-off error:', error);
+        return apiResponse.error(res, error.message, 400);
+    }
+};
+
+const reverseAmendment = async (req, res) => {
+    const { id: userId } = req.user;
+    const amendmentId = parseInt(req.params.amendmentId);
+
+    try {
+        const result = await prisma.$transaction(async (tx) => {
+            // 1. Fetch amendment with full booking details for math
+            const amendment = await tx.bookingAmendment.findUnique({
+                where: { id: amendmentId },
+                include: { 
+                    booking: { 
+                        include: { 
+                            initialPayments: true, 
+                            instalments: { include: { payments: true } },
+                            customerPayables: { include: { settlements: true } },
+                            amendments: true 
+                        } 
+                    }
+                }
+            });
+
+            if (!amendment || amendment.isReversed) throw new Error('Amendment not found or already reversed.');
+
+            // 2. Mark as reversed
+            await tx.bookingAmendment.update({
+                where: { id: amendmentId },
+                data: { isReversed: true }
+            });
+
+            // 3. Recalculate Balance ignoring the newly reversed amendment
+            const booking = amendment.booking;
+            const totalIn = (booking.initialPayments || []).reduce((s, p) => s + p.amount, 0);
+            const totalInst = (booking.instalments || []).reduce((s, i) => s + (i.payments || []).reduce((ps, p) => ps + p.amount, 0), 0);
+            const totalPay = (booking.customerPayables || []).reduce((s, cp) => s + (cp.settlements || []).reduce((ss, s) => ss + s.amount, 0), 0);
+            
+            // Sum only active amendments (this excludes the one we just reversed)
+            const totalAdj = (booking.amendments || [])
+                .filter(a => a.id !== amendmentId && !a.isReversed)
+                .reduce((s, a) => s + a.difference, 0);
+
+            const netReceived = totalIn + totalInst + totalPay;
+            const restoredBalance = (booking.revenue || 0) - netReceived + totalAdj;
+
+            // 4. Update the Booking
+            const updatedBooking = await tx.booking.update({
+                where: { id: booking.id },
+                data: {
+                    balance: restoredBalance,
+                    bookingStatus: restoredBalance > 0 ? 'CONFIRMED' : 'COMPLETED'
+                }
+            });
+
+            return updatedBooking;
+        });
+
+        return apiResponse.success(res, result);
+    } catch (error) {
+        return apiResponse.error(res, error.message, 400);
+    }
+};
 
 module.exports = {
   createPendingBooking,
@@ -4101,5 +4251,7 @@ module.exports = {
   generateInvoice,
   updateAccountingMonth,
   updateCommissionAmount,
-  getCustomerCreditNotes
+  getCustomerCreditNotes,
+  writeOffBookingBalance,
+  reverseAmendment
 };

@@ -6,12 +6,12 @@ const { userValidation } = require('../middleware/validation.middleware');
 const { createUserLimiter } = require('../middleware/rateLimiter');
 
 
-router.post('/create', authenticateToken, authorizeRole(['ADMIN', 'SUPER_ADMIN']), createUserLimiter, userValidation.createUser, createUser); 
+router.post('/create', authenticateToken, createUserLimiter, userValidation.createUser, createUser); 
 router.get('/me', authenticateToken, getMyProfile);
 router.put('/me', authenticateToken, userValidation.updateProfile, updateMyProfile);
 router.get('/agents', authenticateToken, authorizeRole(['ADMIN', 'SUPER_ADMIN']), getAgents);
 
-router.get('/', authenticateToken, authorizeRole(['ADMIN',   'SUPER_ADMIN' ]), getAllUsers);
+router.get('/', authenticateToken, getAllUsers);
 router.put('/:id', authenticateToken, authorizeRole(['ADMIN', 'SUPER_ADMIN' ]), userValidation.updateUserById, updateUserById);
 
 module.exports = router;

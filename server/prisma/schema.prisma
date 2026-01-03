@@ -55,6 +55,7 @@ model Booking {
   voidedBy          User?          @relation("VoidedBookings", fields: [voidedById], references: [id])
 
   customerPayables        CustomerPayable[]
+  amendments BookingAmendment[]
 
   cancellation      Cancellation?   
 
@@ -150,7 +151,6 @@ enum InstalmentStatus {
 model User {
   id        String   @id
   email     String   @unique // CHANGED: Made non-nullable as it's the primary login identifier.
-  
   title     Title?   // CHANGED: Re-using the existing 'Title' enum for consistency.
   firstName String   @map("first_name")
   lastName  String   @map("last_name")
@@ -164,6 +164,7 @@ model User {
   voidedBookings Booking[] @relation("VoidedBookings")
   auditLogs AuditLog[]
   InternalInvoices InternalInvoice[]
+  amendments BookingAmendment[]
 
 
   @@map("users")
@@ -646,3 +647,31 @@ model CustomerCreditNoteUsage {
   @@map("customer_credit_note_usage")
 }
 
+model BookingAmendment {
+  id                Int             @id @default(autoincrement())
+  bookingId         Int             @map("booking_id")
+  booking           Booking         @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  
+  userId            String          @map("user_id")
+  user              User            @relation(fields: [userId], references: [id])
+
+  type              AmendmentType   @default(WRITE_OFF)
+  propertyName      String          @map("property_name") // e.g., "balance"
+  
+  oldValue          Float           @map("old_value")
+  newValue          Float           @map("new_value")
+  difference        Float           // The amount written off
+  
+  reason            String          // The text entered by the user
+  isReversed        Boolean         @default(false) @map("is_reversed")
+  
+  createdAt         DateTime        @default(now()) @map("created_at")
+
+  @@map("booking_amendments")
+}
+
+enum AmendmentType {
+  WRITE_OFF
+  REVENUE_ADJUSTMENT
+  REVERSAL
+}
