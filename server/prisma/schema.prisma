@@ -59,9 +59,13 @@ model Booking {
 
   cancellation      Cancellation?   
 
+  //remove these three 
   accountingMonth  DateTime?         @map("accounting_month")
   internalInvoices InternalInvoice[]
   commissionAmount Float?            @map("commission_amount")
+
+  commissionEntries CommissionLedger[]
+  
 
   @@map("bookings")
 }
@@ -165,6 +169,7 @@ model User {
   auditLogs AuditLog[]
   InternalInvoices InternalInvoice[]
   amendments BookingAmendment[]
+  commissionEntries CommissionLedger[]
 
 
   @@map("users")
@@ -674,4 +679,30 @@ enum AmendmentType {
   WRITE_OFF
   REVENUE_ADJUSTMENT
   REVERSAL
+}
+
+model CommissionLedger {
+  id              Int            @id @default(autoincrement())
+  bookingId       Int            @map("booking_id")
+  booking         Booking        @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  
+  agentId         String         @map("agent_id")
+  agent           User           @relation(fields: [agentId], references: [id])
+
+  type            CommissionType // INITIAL or FINAL_RECONCILIATION
+  amount          Float          // The commission value (positive or negative)
+  
+  // This is the month the commission is "Paid" in the reports
+  commissionMonth DateTime       @map("commission_month") 
+  
+  isSettled       Boolean        @default(false) @map("is_settled")
+  createdAt       DateTime       @default(now()) @map("created_at")
+  updatedAt       DateTime       @updatedAt @map("updated_at")
+
+  @@map("commission_ledger")
+}
+
+enum CommissionType {
+  INITIAL
+  FINAL_RECONCILIATION
 }

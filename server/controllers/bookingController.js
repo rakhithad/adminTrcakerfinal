@@ -6,6 +6,57 @@ const { createAuditLog, ActionType } = require('../utils/auditLogger');
 
 const prisma = new PrismaClient();
 
+//HELPERS
+
+const syncInitialCommission = async (tx, bookingId) => {
+    const booking = await tx.booking.findUnique({
+        where: { id: bookingId },
+        include: { 
+            commissionEntries: { where: { type: 'INITIAL' } } 
+        }
+    });
+
+    if (!booking || booking.bookingStatus === 'VOID') return;
+
+    const profit = parseFloat(booking.profit || 0);
+    const targetAmount = booking.paymentMethod.includes('FULL') ? profit : (profit / 2);
+
+    if (booking.commissionEntries.length > 0) {
+        const hasFinal = await tx.commissionLedger.findFirst({
+            where: { bookingId, type: 'FINAL_RECONCILIATION' }
+        });
+
+        if (!hasFinal) {
+            await tx.commissionLedger.update({
+                where: { id: booking.commissionEntries[0].id },
+                data: { amount: targetAmount }
+            });
+        }
+    } else {
+        // FIX: Ensure you are using the agent's ID, not their Name.
+        // If your Booking model doesn't have agentId, we must find the user by name.
+        const agent = await tx.user.findFirst({
+            where: { 
+                OR: [
+                    { id: booking.agentId }, // Use ID if available
+                    { firstName: booking.agentName.split(' ')[0] } // Fallback to name search
+                ]
+            }
+        });
+
+        if (!agent) throw new Error(`Agent not found for name: ${booking.agentName}`);
+
+        await tx.commissionLedger.create({
+            data: {
+                bookingId: booking.id,
+                agentId: agent.id, // This must be the User.id (e.g., "29eb6411...")
+                type: 'INITIAL',
+                amount: targetAmount,
+                commissionMonth: booking.pcDate
+            }
+        });
+    }
+};
 const compareFolderNumbers = (a, b) => {
   if (!a || !b) return 0;
   const partsA = a.toString().split('.').map(part => parseInt(part, 10));
@@ -17,7 +68,6 @@ const compareFolderNumbers = (a, b) => {
   const subB = partsB.length > 1 ? partsB[1] : 0;
   return subA - subB;
 };
-
 const compareAndLogChanges = async (tx, { modelName, recordId, userId, oldRecord, newRecord, updates }) => {
   const changes = [];
   // Get a list of all fields that were part of the update request
@@ -56,6 +106,9 @@ const compareAndLogChanges = async (tx, { modelName, recordId, userId, oldRecord
     });
   }
 };
+
+
+// CONTROLLERS
 
 const createPendingBooking = async (req, res) => {
   console.log('Received body for pending booking:', JSON.stringify(req.body, null, 2));
@@ -225,209 +278,135 @@ const getPendingBookings = async (req, res) => {
 };
 
 const approveBooking = async (req, res) => {
-  const bookingId = parseInt(req.params.id);
-  if (isNaN(bookingId)) {
-    return apiResponse.error(res, 'Invalid booking ID', 400);
-  }
+  const bookingId = parseInt(req.params.id);
+  if (isNaN(bookingId)) {
+    return apiResponse.error(res, 'Invalid booking ID', 400);
+  }
 
-  const { id: approverId } = req.user;
+  const { id: approverId } = req.user;
 
-  try {
-    const booking = await prisma.$transaction(async (tx) => {
-      // 1. Fetch the complete pending booking, including initialPayments and their usage
-      const pendingBooking = await tx.pendingBooking.findUnique({
-        where: { id: bookingId },
-        include: {
-          costItems: { include: { suppliers: true } },
-          instalments: true,
-          passengers: true,
-          createdBy: true,
-          initialPayments: { // <-- Include the payments
-            include: {
-              appliedCustomerCreditNoteUsage: true // <-- And their usage link
-            }
-          },
-        },
-      });
+  try {
+    const booking = await prisma.$transaction(async (tx) => {
+      const pendingBooking = await tx.pendingBooking.findUnique({
+        where: { id: bookingId },
+        include: {
+          costItems: { include: { suppliers: true } },
+          instalments: true,
+          passengers: true,
+          createdBy: true,
+          initialPayments: { include: { appliedCustomerCreditNoteUsage: true } },
+        },
+      });
 
-      if (!pendingBooking) {
-        throw new Error('Pending booking not found');
-      }
-      if (pendingBooking.status !== 'PENDING') {
-        throw new Error('Pending booking already processed');
-      }
+      if (!pendingBooking) throw new Error('Pending booking not found');
+      if (pendingBooking.status !== 'PENDING') throw new Error('Pending booking already processed');
 
-      const allBookings = await tx.booking.findMany({
-        select: { folderNo: true },
-      });
-      const maxFolderNo = Math.max(
-        0,
-        ...allBookings.map(b => parseInt(b.folderNo.split('.')[0], 10)).filter(n => !isNaN(n)) // Added filter for safety
-      );
-      const newFolderNo = String(maxFolderNo + 1);
+      const allBookings = await tx.booking.findMany({ select: { folderNo: true } });
+      const maxFolderNo = Math.max(0, ...allBookings.map(b => parseInt(b.folderNo.split('.')[0], 10)).filter(n => !isNaN(n)));
+      const newFolderNo = String(maxFolderNo + 1);
 
-      // 2. Create the new Booking *WITHOUT* initialPayments initially
-      const newBooking = await tx.booking.create({
-        data: {
-          folderNo: newFolderNo,
-          refNo: pendingBooking.refNo,
-          paxName: pendingBooking.paxName,
-          agentName: pendingBooking.agentName,
-          teamName: pendingBooking.teamName || null,
-          pnr: pendingBooking.pnr,
-          airline: pendingBooking.airline,
-          fromTo: pendingBooking.fromTo,
-          bookingType: pendingBooking.bookingType,
-          bookingStatus: 'CONFIRMED',
-          pcDate: pendingBooking.pcDate,
-          accountingMonth: new Date(pendingBooking.createdAt.getFullYear(), pendingBooking.createdAt.getMonth(), 1),
-          issuedDate: pendingBooking.issuedDate || null,
-          paymentMethod: pendingBooking.paymentMethod,
-          // Use the last payment date from the pending payments if available
-          lastPaymentDate: pendingBooking.initialPayments.length > 0
-            ? new Date(Math.max(...pendingBooking.initialPayments.map(p => new Date(p.paymentDate).getTime())))
-            : null,
-          travelDate: pendingBooking.travelDate || null,
-          revenue: pendingBooking.revenue ? parseFloat(pendingBooking.revenue) : null,
-          prodCost: pendingBooking.prodCost ? parseFloat(pendingBooking.prodCost) : null,
-          transFee: pendingBooking.transFee ? parseFloat(pendingBooking.transFee) : null,
-          surcharge: pendingBooking.surcharge ? parseFloat(pendingBooking.surcharge) : null,
-          balance: pendingBooking.balance ? parseFloat(pendingBooking.balance) : null,
-          profit: pendingBooking.profit ? parseFloat(pendingBooking.profit) : null,
-          invoiced: pendingBooking.invoiced || null,
-          description: pendingBooking.description || null,
-          numPax: pendingBooking.numPax,
-          // DO NOT create initialPayments here yet
-          costItems: {
-            create: pendingBooking.costItems.map((item) => ({
-              category: item.category,
-              amount: parseFloat(item.amount),
-            })),
-          },
-          instalments: {
-            create: pendingBooking.instalments.map((inst) => ({
-              dueDate: new Date(inst.dueDate),
-              amount: parseFloat(inst.amount),
-              status: inst.status || 'PENDING',
-            })),
-          },
-          passengers: {
-            create: pendingBooking.passengers.map((pax) => ({
-              title: pax.title,
-              firstName: pax.firstName,
-              middleName: pax.middleName || null,
-              lastName: pax.lastName,
-              gender: pax.gender,
-              email: pax.email || null,
-              contactNo: pax.contactNo || null,
-              nationality: pax.nationality || null,
-              birthday: pax.birthday ? new Date(pax.birthday) : null,
-              category: pax.category,
-            })),
-          },
-        },
-        include: {
-          costItems: true, // Needed for supplier graduation
-        }
-      });
+      const newBooking = await tx.booking.create({
+        data: {
+          folderNo: newFolderNo,
+          refNo: pendingBooking.refNo,
+          paxName: pendingBooking.paxName,
+          agentName: pendingBooking.agentName,
+          teamName: pendingBooking.teamName || null,
+          pnr: pendingBooking.pnr,
+          airline: pendingBooking.airline,
+          fromTo: pendingBooking.fromTo,
+          bookingType: pendingBooking.bookingType,
+          bookingStatus: 'CONFIRMED',
+          pcDate: pendingBooking.pcDate,
+          accountingMonth: new Date(pendingBooking.createdAt.getFullYear(), pendingBooking.createdAt.getMonth(), 1),
+          issuedDate: pendingBooking.issuedDate || null,
+          paymentMethod: pendingBooking.paymentMethod,
+          lastPaymentDate: pendingBooking.initialPayments.length > 0
+            ? new Date(Math.max(...pendingBooking.initialPayments.map(p => new Date(p.paymentDate).getTime())))
+            : null,
+          travelDate: pendingBooking.travelDate || null,
+          revenue: pendingBooking.revenue ? parseFloat(pendingBooking.revenue) : null,
+          prodCost: pendingBooking.prodCost ? parseFloat(pendingBooking.prodCost) : null,
+          transFee: pendingBooking.transFee ? parseFloat(pendingBooking.transFee) : null,
+          surcharge: pendingBooking.surcharge ? parseFloat(pendingBooking.surcharge) : null,
+          balance: pendingBooking.balance ? parseFloat(pendingBooking.balance) : null,
+          profit: pendingBooking.profit ? parseFloat(pendingBooking.profit) : null,
+          invoiced: pendingBooking.invoiced || null,
+          description: pendingBooking.description || null,
+          numPax: pendingBooking.numPax,
+          costItems: {
+            create: pendingBooking.costItems.map((item) => ({
+              category: item.category,
+              amount: parseFloat(item.amount),
+            })),
+          },
+          instalments: {
+            create: pendingBooking.instalments.map((inst) => ({
+              dueDate: new Date(inst.dueDate),
+              amount: parseFloat(inst.amount),
+              status: inst.status || 'PENDING',
+            })),
+          },
+          passengers: {
+            create: pendingBooking.passengers.map((pax) => ({
+              title: pax.title, firstName: pax.firstName, middleName: pax.middleName || null, lastName: pax.lastName,
+              gender: pax.gender, email: pax.email || null, contactNo: pax.contactNo || null,
+              nationality: pax.nationality || null, birthday: pax.birthday ? new Date(pax.birthday) : null, category: pax.category,
+            })),
+          },
+        },
+        include: { costItems: true }
+      });
 
-      // 3. Manually create InitialPayments and link credit note usage
-      const createdInitialPayments = [];
-      for (const pendingPayment of pendingBooking.initialPayments) {
-        const newInitialPayment = await tx.initialPayment.create({
-          data: {
-            amount: pendingPayment.amount,
-            transactionMethod: pendingPayment.transactionMethod,
-            paymentDate: pendingPayment.paymentDate,
-            bookingId: newBooking.id // Link to the new Booking
-          }
-        });
-        createdInitialPayments.push(newInitialPayment);
+      for (const pendingPayment of pendingBooking.initialPayments) {
+        const newInitialPayment = await tx.initialPayment.create({
+          data: {
+            amount: pendingPayment.amount,
+            transactionMethod: pendingPayment.transactionMethod,
+            paymentDate: pendingPayment.paymentDate,
+            bookingId: newBooking.id
+          }
+        });
 
-        // If the pending payment used a credit note, update the usage record's link
-        if (pendingPayment.appliedCustomerCreditNoteUsage) {
-          await tx.customerCreditNoteUsage.update({
-            where: { id: pendingPayment.appliedCustomerCreditNoteUsage.id },
-            data: {
-              usedOnInitialPaymentId: newInitialPayment.id // Update to link to the *new* InitialPayment ID
-            }
-          });
-        }
-      }
+        if (pendingPayment.appliedCustomerCreditNoteUsage) {
+          await tx.customerCreditNoteUsage.update({
+            where: { id: pendingPayment.appliedCustomerCreditNoteUsage.id },
+            data: { usedOnInitialPaymentId: newInitialPayment.id }
+          });
+        }
+      }
 
-      // 4. Graduate suppliers (remains the same)
-      for (const [index, pendingItem] of pendingBooking.costItems.entries()) {
-        const newCostItemId = newBooking.costItems[index].id;
-        // Find suppliers associated ONLY with the PENDING cost item
-        const pendingSuppliers = await tx.costItemSupplier.findMany({
-          where: { pendingCostItemId: pendingItem.id }
-        });
-        for (const supplier of pendingSuppliers) {
-          await tx.costItemSupplier.update({ // Use update with the supplier's unique id
-            where: { id: supplier.id },
-            data: {
-              costItemId: newCostItemId,
-              pendingCostItemId: null,
-            },
-          });
-        }
-      }
+      for (const [index, pendingItem] of pendingBooking.costItems.entries()) {
+        const newCostItemId = newBooking.costItems[index].id;
+        const pendingSuppliers = await tx.costItemSupplier.findMany({ where: { pendingCostItemId: pendingItem.id } });
+        for (const supplier of pendingSuppliers) {
+          await tx.costItemSupplier.update({
+            where: { id: supplier.id },
+            data: { costItemId: newCostItemId, pendingCostItemId: null },
+          });
+        }
+      }
 
-      // 5. Audit Logs (remains the same)
-      await createAuditLog(tx, {
-        userId: approverId,
-        modelName: 'PendingBooking',
-        recordId: pendingBooking.id,
-        action: ActionType.APPROVE_PENDING,
-        changes: [{
-          fieldName: 'status',
-          oldValue: 'PENDING',
-          newValue: 'APPROVED'
-        }]
-      });
+      await syncInitialCommission(tx, newBooking.id);
 
-      await createAuditLog(tx, {
-        userId: pendingBooking.createdById, // Logged by the creator
-        modelName: 'Booking',
-        recordId: newBooking.id,
-        action: ActionType.CREATE
-      });
+      await createAuditLog(tx, { userId: approverId, modelName: 'PendingBooking', recordId: pendingBooking.id, action: ActionType.APPROVE_PENDING });
+      await tx.pendingBooking.update({ where: { id: bookingId }, data: { status: 'APPROVED' } });
 
-      // 6. Update Pending Booking Status (remains the same)
-      await tx.pendingBooking.update({
-        where: { id: bookingId },
-        data: { status: 'APPROVED' },
-      });
+      return tx.booking.findUnique({
+        where: { id: newBooking.id },
+        include: {
+          costItems: { include: { suppliers: true } },
+          instalments: true,
+          passengers: true,
+          initialPayments: { include: { appliedCustomerCreditNoteUsage: true } }
+        }
+      });
+    });
 
-      // 7. Return the full booking with all relations
-      return tx.booking.findUnique({
-        where: { id: newBooking.id },
-        include: {
-          costItems: { include: { suppliers: true } },
-          instalments: true,
-          passengers: true,
-          initialPayments: { // Ensure we include the usage link in the final response
-            include: { appliedCustomerCreditNoteUsage: true }
-          }
-        }
-      });
-    });
-
-    return apiResponse.success(res, booking, 200);
-
-  } catch (error) {
-    console.error('Error approving booking:', error);
-    if (error.message === 'Pending booking not found') {
-      return apiResponse.error(res, 'Pending booking not found', 404);
-    }
-    if (error.message === 'Pending booking already processed') {
-      return apiResponse.error(res, 'Pending booking already processed', 409);
-    }
-    if (error.code === 'P2002') {
-      return apiResponse.error(res, 'A booking with this unique identifier (e.g., folder number) already exists.', 409);
-    }
-    return apiResponse.error(res, `Failed to approve booking: ${error.message}`, 500);
-  }
+    return apiResponse.success(res, booking, 200);
+  } catch (error) {
+    return apiResponse.error(res, `Failed to approve booking: ${error.message}`, 500);
+  }
 };
 
 
@@ -490,177 +469,145 @@ const rejectBooking = async (req, res) => {
 };
 
 const createBooking = async (req, res) => {
-  const { id: userId } = req.user;
+  const { id: userId } = req.user;
 
-  try {
-    // Separate initialPayments and breakdown from the rest
-    const { initialPayments = [], prodCostBreakdown = [], ...bookingData } = req.body;
+  try {
+    const { initialPayments = [], prodCostBreakdown = [], ...bookingData } = req.body;
 
-    const requiredFields = [ 'ref_no', 'pax_name', 'agent_name', 'team_name', 'pnr', 'airline', 'from_to', 'bookingType', 'paymentMethod', 'pcDate', 'travelDate', 'numPax' ]; // Added numPax
-    const missingFields = requiredFields.filter(field => !bookingData[field] && bookingData[field] !== 0); // Allow 0
-    if (missingFields.length > 0) {
-      return apiResponse.error(res, `Missing required fields: ${missingFields.join(', ')}`, 400);
-    }
-    if (initialPayments.length === 0) {
-      return apiResponse.error(res, "At least one initial payment must be provided.", 400);
-    }
-    // Add further validation for passengers, costItems etc. if needed
+    const requiredFields = [ 'ref_no', 'pax_name', 'agent_name', 'team_name', 'pnr', 'airline', 'from_to', 'bookingType', 'paymentMethod', 'pcDate', 'travelDate', 'numPax' ];
+    const missingFields = requiredFields.filter(field => !bookingData[field] && bookingData[field] !== 0);
+    if (missingFields.length > 0) {
+      return apiResponse.error(res, `Missing required fields: ${missingFields.join(', ')}`, 400);
+    }
+    if (initialPayments.length === 0) {
+      return apiResponse.error(res, "At least one initial payment must be provided.", 400);
+    }
 
-    const booking = await prisma.$transaction(async (tx) => {
-      const calculatedProdCost = prodCostBreakdown.reduce((sum, item) => sum + parseFloat(item.amount || 0), 0);
-      const calculatedReceived = initialPayments.reduce((sum, p) => sum + parseFloat(p.amount || 0), 0);
+    const booking = await prisma.$transaction(async (tx) => {
+      const calculatedProdCost = prodCostBreakdown.reduce((sum, item) => sum + parseFloat(item.amount || 0), 0);
+      const calculatedReceived = initialPayments.reduce((sum, p) => sum + parseFloat(p.amount || 0), 0);
 
-      const revenue = bookingData.revenue ? parseFloat(bookingData.revenue) : 0;
-      const transFee = bookingData.transFee ? parseFloat(bookingData.transFee) : 0;
-      const surcharge = bookingData.surcharge ? parseFloat(bookingData.surcharge) : 0;
+      const revenue = bookingData.revenue ? parseFloat(bookingData.revenue) : 0;
+      const transFee = bookingData.transFee ? parseFloat(bookingData.transFee) : 0;
+      const surcharge = bookingData.surcharge ? parseFloat(bookingData.surcharge) : 0;
 
-      const profit = revenue - calculatedProdCost - transFee - surcharge;
-      const balance = revenue - calculatedReceived;
+      const profit = revenue - calculatedProdCost - transFee - surcharge;
+      const balance = revenue - calculatedReceived;
+      const pcDate = new Date(bookingData.pcDate);
 
-      const pcDate = new Date(bookingData.pcDate);
+      const allBookings = await tx.booking.findMany({ select: { folderNo: true } });
+      const maxFolderNo = Math.max(
+        0,
+        ...allBookings.map(b => parseInt(b.folderNo.split('.')[0], 10)).filter(n => !isNaN(n))
+      );
+      const newFolderNo = String(maxFolderNo + 1);
 
-      // --- Find next Folder No ---
-      const allBookings = await tx.booking.findMany({ select: { folderNo: true } });
-      const maxFolderNo = Math.max(
-        0,
-        ...allBookings.map(b => parseInt(b.folderNo.split('.')[0], 10)).filter(n => !isNaN(n))
-      );
-      const newFolderNo = String(maxFolderNo + 1);
-      // --- End Folder No ---
+      const newBooking = await tx.booking.create({
+        data: {
+          folderNo: newFolderNo,
+          refNo: bookingData.ref_no,
+          paxName: bookingData.pax_name,
+          agentName: bookingData.agent_name,
+          teamName: bookingData.team_name,
+          pnr: bookingData.pnr,
+          airline: bookingData.airline,
+          fromTo: bookingData.from_to,
+          bookingType: bookingData.bookingType,
+          bookingStatus: bookingData.bookingStatus || 'CONFIRMED',
+          pcDate: pcDate,
+          issuedDate: bookingData.issuedDate ? new Date(bookingData.issuedDate) : null,
+          paymentMethod: bookingData.paymentMethod,
+          lastPaymentDate: initialPayments.length > 0
+            ? new Date(Math.max(...initialPayments.map(p => new Date(p.receivedDate).getTime())))
+            : null,
+          travelDate: new Date(bookingData.travelDate),
+          description: bookingData.description || null,
+          revenue,
+          prodCost: calculatedProdCost,
+          transFee,
+          surcharge,
+          profit,
+          balance,
+          invoiced: bookingData.invoiced || null,
+          accountingMonth: new Date(pcDate.getFullYear(), pcDate.getMonth(), 1),
+          numPax: parseInt(bookingData.numPax),
+          costItems: {
+            create: prodCostBreakdown.map(item => ({
+              category: item.category, amount: parseFloat(item.amount),
+              suppliers: { create: (item.suppliers || []).map(s => ({ ...s, amount: parseFloat(s.amount) })) },
+            })),
+          },
+          instalments: {
+            create: (bookingData.instalments || []).map(inst => ({
+              ...inst, dueDate: new Date(inst.dueDate), amount: parseFloat(inst.amount), status: inst.status || 'PENDING'
+            })),
+          },
+          passengers: {
+            create: (bookingData.passengers || []).map(pax => ({
+              ...pax, birthday: pax.birthday ? new Date(pax.birthday) : null,
+            })),
+          },
+        },
+      });
 
-      // Step 1: Create the Booking *WITHOUT* initialPayments
-      const newBooking = await tx.booking.create({
-        data: {
-          folderNo: newFolderNo, // Use the calculated folder number
-          refNo: bookingData.ref_no,
-          paxName: bookingData.pax_name,
-          agentName: bookingData.agent_name,
-          teamName: bookingData.team_name,
-          pnr: bookingData.pnr,
-          airline: bookingData.airline,
-          fromTo: bookingData.from_to,
-          bookingType: bookingData.bookingType,
-          bookingStatus: bookingData.bookingStatus || 'CONFIRMED', // Default to CONFIRMED for direct creation
-          pcDate: pcDate,
-          issuedDate: bookingData.issuedDate ? new Date(bookingData.issuedDate) : null, // Corrected date handling
-          paymentMethod: bookingData.paymentMethod,
-          // Set lastPaymentDate based on payments
-          lastPaymentDate: initialPayments.length > 0
-            ? new Date(Math.max(...initialPayments.map(p => new Date(p.receivedDate).getTime())))
-            : null,
-          travelDate: new Date(bookingData.travelDate),
-          description: bookingData.description || null,
-          revenue,
-          prodCost: calculatedProdCost,
-          transFee,
-          surcharge,
-          profit,
-          balance,
-          invoiced: bookingData.invoiced || null,
-          accountingMonth: new Date(pcDate.getFullYear(), pcDate.getMonth(), 1),
-          numPax: parseInt(bookingData.numPax), // Parse numPax
-          // DO NOT create initialPayments here
-          costItems: {
-            create: prodCostBreakdown.map(item => ({
-              category: item.category, amount: parseFloat(item.amount),
-              // Suppliers can be created directly here if structure is simple
-              suppliers: { create: (item.suppliers || []).map(s => ({ ...s, amount: parseFloat(s.amount) })) },
-            })),
-          },
-          instalments: {
-            create: (bookingData.instalments || []).map(inst => ({
-              ...inst, dueDate: new Date(inst.dueDate), amount: parseFloat(inst.amount), status: inst.status || 'PENDING'
-            })),
-          },
-          passengers: {
-            create: (bookingData.passengers || []).map(pax => ({
-              ...pax, birthday: pax.birthday ? new Date(pax.birthday) : null,
-            })),
-          },
-        },
-      });
+      for (const payment of initialPayments) {
+        const newInitialPayment = await tx.initialPayment.create({
+          data: {
+            amount: parseFloat(payment.amount),
+            transactionMethod: payment.transactionMethod,
+            paymentDate: new Date(payment.receivedDate),
+            bookingId: newBooking.id
+          }
+        });
 
-      // Step 2: Manually loop and create InitialPayments, handle credit notes
-      for (const payment of initialPayments) {
-        const newInitialPayment = await tx.initialPayment.create({
-          data: {
-            amount: parseFloat(payment.amount),
-            transactionMethod: payment.transactionMethod,
-            paymentDate: new Date(payment.receivedDate),
-            bookingId: newBooking.id // Link to the new main booking
-          }
-        });
+        if (payment.transactionMethod === 'CUSTOMER_CREDIT_NOTE' && payment.creditNoteDetails) {
+          for (const usedNote of payment.creditNoteDetails) {
+            const creditNote = await tx.customerCreditNote.findUnique({ where: { id: usedNote.id } });
+            if (!creditNote) throw new Error(`Customer Credit Note ${usedNote.id} not found.`);
+            const newRemaining = creditNote.remainingAmount - usedNote.amountToUse;
+            await tx.customerCreditNote.update({
+              where: { id: usedNote.id },
+              data: {
+                remainingAmount: newRemaining,
+                status: newRemaining < 0.01 ? 'USED' : 'PARTIALLY_USED'
+              }
+            });
+            await tx.customerCreditNoteUsage.create({
+              data: {
+                amountUsed: usedNote.amountToUse,
+                creditNoteId: usedNote.id,
+                usedOnInitialPaymentId: newInitialPayment.id
+              }
+            });
+          }
+        }
+      }
 
-        // Step 3: If it's a credit note, process it (same logic as createPendingBooking)
-        if (payment.transactionMethod === 'CUSTOMER_CREDIT_NOTE' && payment.creditNoteDetails) {
-          for (const usedNote of payment.creditNoteDetails) {
-            const creditNote = await tx.customerCreditNote.findUnique({
-              where: { id: usedNote.id }
-            });
+      await syncInitialCommission(tx, newBooking.id);
 
-            if (!creditNote) throw new Error(`Customer Credit Note ${usedNote.id} not found.`);
-            if (creditNote.remainingAmount < usedNote.amountToUse) throw new Error(`Insufficient funds on Credit Note ${usedNote.id}.`);
+      await createAuditLog(tx, {
+        userId: userId,
+        modelName: 'Booking',
+        recordId: newBooking.id,
+        action: ActionType.CREATE,
+      });
 
-            const newRemaining = creditNote.remainingAmount - usedNote.amountToUse;
-            await tx.customerCreditNote.update({
-              where: { id: usedNote.id },
-              data: {
-                remainingAmount: newRemaining,
-                status: newRemaining < 0.01 ? 'USED' : 'PARTIALLY_USED'
-              }
-            });
+      return tx.booking.findUnique({
+        where: { id: newBooking.id },
+        include: {
+          costItems: { include: { suppliers: true } },
+          instalments: true,
+          passengers: true,
+          initialPayments: { include: { appliedCustomerCreditNoteUsage: true } }
+        },
+      });
+    });
 
-            await tx.customerCreditNoteUsage.create({
-              data: {
-                amountUsed: usedNote.amountToUse,
-                creditNoteId: usedNote.id,
-                usedOnInitialPaymentId: newInitialPayment.id // Link to the InitialPayment
-              }
-            });
-          }
-        }
-      }
-      // --- End Initial Payment Loop ---
-
-      await createAuditLog(tx, {
-        userId: userId,
-        modelName: 'Booking',
-        recordId: newBooking.id,
-        action: ActionType.CREATE,
-      });
-
-      // Step 4: Return the full booking with relations
-      return tx.booking.findUnique({
-        where: { id: newBooking.id },
-        include: {
-          costItems: { include: { suppliers: true } },
-          instalments: true,
-          passengers: true,
-          initialPayments: { // Include the linked usage
-            include: { appliedCustomerCreditNoteUsage: true }
-          }
-        },
-      });
-    });
-
-    return apiResponse.success(res, booking, 201);
-  } catch (error) {
-    console.error("Booking creation error:", error);
-    if (error.message.includes('Credit Note') || error.message.includes('Insufficient funds')) {
-      return apiResponse.error(res, error.message, 400);
-    }
-    if (error.code === 'P2002') {
-      // More specific error based on constraint (adapt if needed)
-      if (error.meta?.target?.includes('folderNo')) {
-        return apiResponse.error(res, "Booking with this folder number already exists", 409);
-      }
-      if (error.meta?.target?.includes('refNo')) {
-        return apiResponse.error(res, "Booking with this reference number already exists", 409);
-      }
-      return apiResponse.error(res, "A unique constraint violation occurred.", 409);
-    }
-    return apiResponse.error(res, "Failed to create booking: " + error.message, 500);
-  }
+    return apiResponse.success(res, booking, 201);
+  } catch (error) {
+    console.error("Booking creation error:", error);
+    return apiResponse.error(res, "Failed to create booking: " + error.message, 500);
+  }
 };
 
 const getBookings = async (req, res) => {
@@ -1122,16 +1069,14 @@ const getRecentBookings = async (req, res) => {
 
 const updateInstalment = async (req, res) => {
   const { id: userId } = req.user;
-  const { id } = req.params; // This is the Instalment ID
-  const { amount, status, transactionMethod, paymentDate } = req.body; // 'amount' here is the payment amount
+  const { id } = req.params; 
+  const { amount, status, transactionMethod, paymentDate } = req.body; 
 
   try {
     const paymentAmount = parseFloat(amount);
     if (isNaN(paymentAmount) || paymentAmount <= 0) {
         return apiResponse.error(res, 'Payment amount must be a positive number.', 400);
     }
-    // For this flow, we assume a payment means the instalment status will become PAID.
-    // If partial payments were allowed, this logic would be more complex.
     if (status !== 'PAID') {
         return apiResponse.error(res, 'Invalid status for payment action. Expected "PAID".', 400);
     }
@@ -1140,34 +1085,25 @@ const updateInstalment = async (req, res) => {
     }
 
     const result = await prisma.$transaction(async (tx) => {
-      // 1. Fetch the instalment and its associated booking with all necessary details
       const instalmentToUpdate = await tx.instalment.findUnique({
         where: { id: parseInt(id) },
         include: { 
             booking: {
-                // Select all fields needed for comprehensive balance calculation
-                select: {
-                    id: true,
-                    revenue: true,
+                include: {
                     initialPayments: true,
-                    // Note: We'll re-fetch all instalments and their payments separately for accuracy
+                    amendments: { where: { isReversed: false } },
+                    commissionEntries: { where: { type: 'INITIAL' } },
+                    customerPayables: { include: { settlements: true } }
                 }
             },
-            payments: true // Include existing payments for this specific instalment
+            payments: true 
         },
       });
 
-      if (!instalmentToUpdate) {
-        throw new Error('Instalment not found');
-      }
+      if (!instalmentToUpdate) throw new Error('Instalment not found');
+      if (instalmentToUpdate.status === 'PAID') throw new Error('This instalment has already been marked as PAID.');
 
-      // Prevent re-processing if already paid (based on current flow's assumption)
-      if (instalmentToUpdate.status === 'PAID') {
-          throw new Error('This instalment has already been marked as PAID.');
-      }
-
-      // 2. Create the new instalment payment record
-      const newPayment = await tx.instalmentPayment.create({
+      await tx.instalmentPayment.create({
           data: {
               instalmentId: parseInt(id),
               amount: paymentAmount,
@@ -1176,95 +1112,102 @@ const updateInstalment = async (req, res) => {
           },
       });
 
-      // 3. Update the instalment's status (DO NOT update instalment.amount with payment amount)
       const updatedInstalment = await tx.instalment.update({
         where: { id: parseInt(id) },
-        data: { status: 'PAID' }, // Mark instalment as PAID after successful payment
-        include: { payments: true } // Re-fetch payments to ensure we have the very latest for return
+        data: { status: 'PAID' }, 
+        include: { payments: true } 
       });
 
-      // --- Recalculate Booking's Total Received and Balance from scratch ---
-      // This is the most reliable way to ensure consistency after a payment.
+      const booking = instalmentToUpdate.booking;
+      const sumOfInitialPayments = booking.initialPayments.reduce((sum, p) => sum + parseFloat(p.amount || 0), 0);
 
-      // Get all initial payments for the booking
-      const sumOfInitialPayments = instalmentToUpdate.booking.initialPayments.reduce((sum, p) => sum + p.amount, 0);
-
-      // Get ALL instalments for the booking (with their latest payments)
-      // This ensures we capture the payment just added and any other existing payments.
       const allBookingsInstalments = await tx.instalment.findMany({
           where: { bookingId: instalmentToUpdate.bookingId },
           include: { payments: true }
       });
 
-      // Calculate total paid via all instalments for the booking
       const totalPaidViaInstalments = allBookingsInstalments.reduce((instSum, inst) => 
-          instSum + inst.payments.reduce((paySum, p) => paySum + p.amount, 0), 0
+          instSum + inst.payments.reduce((paySum, p) => paySum + parseFloat(p.amount || 0), 0), 0
       );
       
-      const newTotalReceived = sumOfInitialPayments + totalPaidViaInstalments;
-      const newBalance = (instalmentToUpdate.booking.revenue || 0) - newTotalReceived;
+      const sumOfPayables = booking.customerPayables.reduce((s, cp) => 
+          s + cp.settlements.reduce((ss, s) => ss + parseFloat(s.amount || 0), 0), 0
+      );
+
+      const totalAdjustments = booking.amendments.reduce((sum, a) => sum + parseFloat(a.difference || 0), 0);
       
-      // 4. Update the parent booking's balance and lastPaymentDate
-      const oldBookingBalance = instalmentToUpdate.booking.balance; // Store old balance for audit log
+      const newTotalReceived = sumOfInitialPayments + totalPaidViaInstalments + sumOfPayables;
+      const finalRevenue = parseFloat(booking.revenue || 0);
+      const newBalance = finalRevenue - newTotalReceived + totalAdjustments;
+      
       const updatedBooking = await tx.booking.update({
           where: { id: instalmentToUpdate.bookingId },
           data: {
               balance: newBalance,
-              lastPaymentDate: new Date(paymentDate), // Update last payment date
+              lastPaymentDate: new Date(paymentDate),
+              bookingStatus: Math.abs(newBalance) < 0.01 ? 'COMPLETED' : booking.bookingStatus
           }
       });
 
-      // 5. Create Audit Logs for both Instalment and Booking
+      if (Math.abs(newBalance) < 0.01) {
+          const existingReconciliation = await tx.commissionLedger.findFirst({
+              where: { bookingId: booking.id, type: 'FINAL_RECONCILIATION' }
+          });
+
+          if (!existingReconciliation) {
+              const initialPaid = booking.commissionEntries[0]?.amount || 0;
+              const finalProfit = (finalRevenue - parseFloat(booking.prodCost || 0)) + totalAdjustments;
+              const reconciliationAmount = finalProfit - initialPaid;
+
+              let finalAgentId = null;
+              const agentUser = await tx.user.findFirst({
+                  where: { 
+                      OR: [
+                          { firstName: { contains: booking.agentName.split(' ')[0], mode: 'insensitive' } },
+                          { id: booking.agentId || undefined }
+                      ]
+                  }
+              });
+              finalAgentId = agentUser?.id;
+
+              if (finalAgentId && Math.abs(reconciliationAmount) > 0.01) {
+                  await tx.commissionLedger.create({
+                    data: {
+                      bookingId: booking.id,
+                      agentId: finalAgentId,
+                      type: 'FINAL_RECONCILIATION',
+                      amount: reconciliationAmount,
+                      commissionMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1)
+                    }
+                  });
+              }
+          }
+      }
+
       await createAuditLog(tx, {
         userId,
         modelName: 'Instalment',
         recordId: instalmentToUpdate.id,
-        action: ActionType.UPDATE,
-        changes: [{
-          fieldName: 'status',
-          oldValue: instalmentToUpdate.status,
-          newValue: 'PAID'
-        },
-        {
-          fieldName: 'payment_recorded', // Specific audit for the payment itself
-          oldValue: `No payment recorded`,
-          newValue: `£${paymentAmount.toFixed(2)} via ${transactionMethod}`
-        }
+        action: 'UPDATE',
+        changes: [
+            { fieldName: 'status', oldValue: instalmentToUpdate.status, newValue: 'PAID' },
+            { fieldName: 'payment_recorded', oldValue: `No payment recorded`, newValue: `£${paymentAmount.toFixed(2)} via ${transactionMethod}` }
         ]
       });
 
-      await createAuditLog(tx, {
-        userId,
-        modelName: 'Booking',
-        recordId: instalmentToUpdate.bookingId,
-        action: ActionType.SETTLEMENT_PAYMENT,
-        changes: [{
-          fieldName: 'balance',
-          oldValue: oldBookingBalance !== undefined ? oldBookingBalance.toFixed(2) : 'N/A',
-          newValue: newBalance.toFixed(2)
-        }]
-      });
-
-      // 6. Return the updated instalment and booking details for frontend state update
       return {
-          updatedInstalment: updatedInstalment, // Already includes the new payment due to include: { payments: true }
+          updatedInstalment: updatedInstalment,
           bookingUpdate: {
               id: updatedBooking.id,
               balance: updatedBooking.balance,
-              received: newTotalReceived.toFixed(2) // Frontend expects this for its state update
+              received: newTotalReceived.toFixed(2)
           }
       };
-    }, {
-        timeout: 10000 // Increase transaction timeout to 10 seconds (default is 5s)
-    }); // End of prisma.$transaction
+    }, { timeout: 15000 });
 
     return apiResponse.success(res, result);
   } catch (error) {
     console.error('Error updating instalment:', error);
-    if (error.message.includes('not found') || error.message.includes('already been marked as PAID')) {
-      return apiResponse.error(res, error.message, 404);
-    }
-    // Catch generic transaction or other errors
     return apiResponse.error(res, `Failed to update instalment: ${error.message}`, 500);
   }
 };
@@ -2347,80 +2290,47 @@ const updatePendingBooking = async (req, res) => {
 
 const recordSettlementPayment = async (req, res) => {
   const { id: userId } = req.user;
-  const bookingId = parseInt(req.params.bookingId); // Corrected from req.params.id to req.params.bookingId
+  const bookingId = parseInt(req.params.bookingId);
   const { amount, transactionMethod, paymentDate } = req.body;
 
   try {
-    // 1. Validation
-    if (isNaN(bookingId)) {
-      return apiResponse.error(res, 'Invalid Booking ID', 400);
-    }
     const paymentAmount = parseFloat(amount);
-    if (isNaN(paymentAmount) || paymentAmount <= 0) {
-      return apiResponse.error(res, 'Payment amount must be a positive number', 400);
-    }
-    if (!transactionMethod || !paymentDate) {
-        return apiResponse.error(res, 'Transaction method and payment date are required.', 400);
-    }
-    if (isNaN(new Date(paymentDate).getTime())) {
-        return apiResponse.error(res, 'Invalid payment date', 400);
-    }
-
-    const validTransactionMethods = ['LOYDS', 'STRIPE', 'WISE', 'HUMM', 'CREDIT_NOTES', 'CREDIT', 'BANK_TRANSFER']; // Ensure this list is complete
-    if (!validTransactionMethods.includes(transactionMethod)) {
-      return apiResponse.error(res, `Invalid transactionMethod. Must be one of: ${validTransactionMethods.join(', ')}`, 400);
-    }
-
-
     const result = await prisma.$transaction(async (tx) => {
-      // 2. Fetch the Booking with ALL necessary relations for comprehensive recalculation
       const booking = await tx.booking.findUnique({
         where: { id: bookingId },
         include: {
           initialPayments: true,
-          instalments: { include: { payments: true } }, // Include payments to all instalments
-          customerPayables: { include: { settlements: true } }, // Include customer payables for full received calculation
+          instalments: { include: { payments: true } },
+          customerPayables: { include: { settlements: true } },
+          amendments: { where: { isReversed: false } },
+          commissionEntries: { where: { type: 'INITIAL' } },
+          agent: true
         },
       });
 
-      if (!booking) {
-        throw new Error('Booking not found');
-      }
+      if (!booking) throw new Error('Booking not found');
 
-      const currentBalance = parseFloat(booking.balance || 0); // Use parsed balance from DB
-      if (paymentAmount > currentBalance + 0.01) { // Add tolerance for floating-point issues
-          throw new Error(`Payment (£${paymentAmount.toFixed(2)}) exceeds pending balance (£${currentBalance.toFixed(2)})`);
-      }
-
-      // 3. Find or Create the Special "SETTLEMENT" Instalment
       let settlementInstalment = booking.instalments.find(inst => inst.status === 'SETTLEMENT');
-
       if (!settlementInstalment) {
         settlementInstalment = await tx.instalment.create({
           data: {
             bookingId: booking.id,
-            dueDate: new Date(paymentDate), // Due date is the settlement date
-            amount: paymentAmount, // Initial amount is the payment amount, it will effectively be "paid"
+            dueDate: new Date(paymentDate),
+            amount: paymentAmount,
             status: 'SETTLEMENT',
           },
         });
       } else {
-          // If settlement instalment already exists, update its amount to reflect total settled
-          // This ensures its 'amount' field represents the sum of all payments made to it
-          const currentSettlementAmount = settlementInstalment.amount;
-          await tx.instalment.update({
-              where: { id: settlementInstalment.id },
-              data: {
-                  amount: currentSettlementAmount + paymentAmount,
-                  dueDate: new Date(paymentDate), // Update due date to latest settlement date
-              }
-          });
-          // Update the in-memory object for later calculations if needed
-          settlementInstalment.amount += paymentAmount;
+        await tx.instalment.update({
+          where: { id: settlementInstalment.id },
+          data: {
+            amount: settlementInstalment.amount + paymentAmount,
+            dueDate: new Date(paymentDate),
+          }
+        });
       }
 
-      // 4. Record the Actual Payment against the settlement instalment
-      const newInstalmentPayment = await tx.instalmentPayment.create({
+      await tx.instalmentPayment.create({
         data: {
           instalmentId: settlementInstalment.id,
           amount: paymentAmount,
@@ -2428,75 +2338,79 @@ const recordSettlementPayment = async (req, res) => {
           paymentDate: new Date(paymentDate),
         },
       });
-      
-      // 5. Recalculate Booking's Total Received and Balance from scratch (Comprehensive)
-      
-      // Sum all initial payments
-      const totalInitialPayments = (booking.initialPayments || []).reduce((sum, p) => sum + p.amount, 0);
 
-      // Sum all payments made to all instalments (including the 'SETTLEMENT' one)
-      // Re-fetch instalments with payments to ensure the very latest payment is included
-      const allInstalmentsWithLatestPayments = await tx.instalment.findMany({
-          where: { bookingId: booking.id },
-          include: { payments: true }
+      const totalInitial = booking.initialPayments.reduce((s, p) => s + parseFloat(p.amount || 0), 0);
+      
+      const freshInstalments = await tx.instalment.findMany({
+        where: { bookingId: booking.id },
+        include: { payments: true }
       });
-      const totalInstalmentPayments = (allInstalmentsWithLatestPayments || []).reduce((instSum, inst) => 
-          instSum + (inst.payments || []).reduce((pSum, p) => pSum + p.amount, 0), 0
-      );
-
-      // Sum all customer payable settlements (for cancellation debts, if any)
-      const totalCustomerPayableSettlements = (booking.customerPayables || []).reduce((sum, payable) => 
-          sum + (payable.settlements || []).reduce((sSum, s) => sSum + s.amount, 0), 0);
       
-      const newTotalReceived = totalInitialPayments + totalInstalmentPayments + totalCustomerPayableSettlements;
-      const newBalance = (booking.revenue || 0) - newTotalReceived;
+      const totalInstalments = freshInstalments.reduce((s, i) => 
+        s + i.payments.reduce((ps, p) => ps + parseFloat(p.amount || 0), 0), 0);
+        
+      const totalPayables = booking.customerPayables.reduce((s, cp) => 
+        s + cp.settlements.reduce((ss, s) => ss + parseFloat(s.amount || 0), 0), 0);
+        
+      const totalAdjustments = booking.amendments.reduce((s, a) => s + parseFloat(a.difference || 0), 0);
+      
+      const totalReceived = totalInitial + totalInstalments + totalPayables;
+      const finalRevenue = parseFloat(booking.revenue || 0);
+      const newBalance = finalRevenue - totalReceived + totalAdjustments;
 
-      // Store old balance for audit log
-      const oldBookingBalance = booking.balance;
-
-      // 6. Update the main Booking's balance and lastPaymentDate
       const updatedBooking = await tx.booking.update({
         where: { id: booking.id },
         data: {
           balance: newBalance,
-          lastPaymentDate: new Date(paymentDate), // Update last payment date
+          lastPaymentDate: new Date(paymentDate),
+          bookingStatus: Math.abs(newBalance) < 0.01 ? 'COMPLETED' : booking.bookingStatus
         },
       });
 
-      // 7. Create Audit Log for the Booking
-      await createAuditLog(tx, {
-        userId,
-        modelName: 'Booking',
-        recordId: booking.id,
-        action: ActionType.SETTLEMENT_PAYMENT,
-        changes: [{
-          fieldName: 'balance', 
-          oldValue: oldBookingBalance !== undefined ? oldBookingBalance.toFixed(2) : 'N/A',
-          newValue: newBalance.toFixed(2)
-        }]
-      });
+      if (Math.abs(newBalance) < 0.01) {
+        const existingReconciliation = await tx.commissionLedger.findFirst({
+            where: { bookingId: booking.id, type: 'FINAL_RECONCILIATION' }
+        });
 
-      // 8. Return a useful payload for frontend state update
-      return {
-          bookingUpdate: {
-              id: updatedBooking.id,
-              balance: updatedBooking.balance,
-              received: newTotalReceived.toFixed(2), // Frontend expects this for its state update
-          }
-      };
-    }, {
-        timeout: 10000 // Increase transaction timeout to 10 seconds
-    }); // End of prisma.$transaction
+        if (!existingReconciliation) {
+            const initialPaid = booking.commissionEntries[0]?.amount || 0;
+            const finalProfit = (finalRevenue - parseFloat(booking.prodCost || 0)) + totalAdjustments;
+            const reconciliationAmount = finalProfit - initialPaid;
+
+            let finalAgentId = booking.agentId;
+            if (!finalAgentId) {
+                const agentUser = await tx.user.findFirst({
+                    where: { 
+                        OR: [
+                            { firstName: booking.agentName.split(' ')[0] },
+                            { id: booking.createdBy?.id }
+                        ]
+                    }
+                });
+                finalAgentId = agentUser?.id;
+            }
+
+            if (finalAgentId && Math.abs(reconciliationAmount) > 0.01) {
+                await tx.commissionLedger.create({
+                  data: {
+                    bookingId: booking.id,
+                    agentId: finalAgentId,
+                    type: 'FINAL_RECONCILIATION',
+                    amount: reconciliationAmount,
+                    commissionMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1)
+                  }
+                });
+            }
+        }
+      }
+
+      return updatedBooking;
+    });
 
     return apiResponse.success(res, result);
-
   } catch (error) {
-    console.error('Error recording settlement payment:', error);
-    if (error.message.includes('not found')) return apiResponse.error(res, error.message, 404);
-    if (error.message.includes('exceeds pending balance')) return apiResponse.error(res, error.message, 400);
-    if (error.message.includes('Invalid')) return apiResponse.error(res, error.message, 400); // Catch explicit validation errors
-    if (error.name === 'PrismaClientValidationError') return apiResponse.error(res, `Invalid data provided: ${error.message}`, 400);
-    return apiResponse.error(res, `Failed to record settlement: ${error.message}`, 500);
+    console.error("Settlement Error:", error);
+    return apiResponse.error(res, error.message, 500);
   }
 };
 
@@ -4090,74 +4004,91 @@ const getCustomerCreditNotes = async (req, res) => {
 };
 
 const writeOffBookingBalance = async (req, res) => {
-    const { id: userId } = req.user;
-    const bookingId = parseInt(req.params.id);
-    const { reason } = req.body;
+  const { id: userId } = req.user;
+  const bookingId = parseInt(req.params.id);
+  const { reason } = req.body;
 
-    try {
-        const result = await prisma.$transaction(async (tx) => {
-            // 1. Fetch current booking state
-            const booking = await tx.booking.findUnique({
-                where: { id: bookingId },
-                include: {
-                    initialPayments: true,
-                    instalments: { include: { payments: true } },
-                    customerPayables: { include: { settlements: true } },
-                    amendments: { where: { isReversed: false } } // Include active adjustments
-                }
-            });
+  try {
+    const result = await prisma.$transaction(async (tx) => {
+      const booking = await tx.booking.findUnique({
+        where: { id: bookingId },
+        include: {
+          initialPayments: true,
+          instalments: { include: { payments: true } },
+          customerPayables: { include: { settlements: true } },
+          amendments: { where: { isReversed: false } },
+          commissionEntries: { where: { type: 'INITIAL' } },
+          agent: true
+        }
+      });
 
-            if (!booking) throw new Error('Booking not found');
-            
-            const currentBalance = parseFloat(booking.balance || 0);
-            if (Math.abs(currentBalance) < 0.01) throw new Error('Balance is already zero');
+      if (!booking) throw new Error('Booking not found');
+      const currentBalance = parseFloat(booking.balance || 0);
 
-            // 2. Create the Amendment Record (The "Paper Trail")
-            const amendment = await tx.bookingAmendment.create({
+      const amendment = await tx.bookingAmendment.create({
+        data: {
+          bookingId: booking.id,
+          userId: userId,
+          type: 'WRITE_OFF',
+          propertyName: 'balance',
+          oldValue: currentBalance,
+          newValue: 0,
+          difference: -currentBalance,
+          reason: reason
+        }
+      });
+
+      const updatedBooking = await tx.booking.update({
+        where: { id: booking.id },
+        data: {
+          balance: 0,
+          bookingStatus: 'COMPLETED'
+        }
+      });
+
+      const existingReconciliation = await tx.commissionLedger.findFirst({
+          where: { bookingId: booking.id, type: 'FINAL_RECONCILIATION' }
+      });
+
+      if (!existingReconciliation) {
+          const initialPaid = booking.commissionEntries[0]?.amount || 0;
+          const totalIn = booking.initialPayments.reduce((s, p) => s + parseFloat(p.amount || 0), 0);
+          const totalInst = booking.instalments.reduce((s, i) => s + i.payments.reduce((ps, p) => ps + parseFloat(p.amount || 0), 0), 0);
+          const totalPay = booking.customerPayables.reduce((s, cp) => s + cp.settlements.reduce((ss, s) => ss + parseFloat(s.amount || 0), 0), 0);
+          const totalAdj = booking.amendments.reduce((s, a) => s + parseFloat(a.difference || 0), 0) + (-currentBalance);
+
+          const finalProfit = (parseFloat(booking.revenue) - parseFloat(booking.prodCost)) + totalAdj;
+          const reconciliationAmount = finalProfit - initialPaid;
+
+          let finalAgentId = booking.agentId;
+          if (!finalAgentId) {
+              const agentUser = await tx.user.findFirst({
+                  where: { firstName: booking.agentName.split(' ')[0] }
+              });
+              finalAgentId = agentUser?.id;
+          }
+
+          if (finalAgentId && Math.abs(reconciliationAmount) > 0.01) {
+              await tx.commissionLedger.create({
                 data: {
-                    bookingId: booking.id,
-                    userId: userId,
-                    type: 'WRITE_OFF',
-                    propertyName: 'balance',
-                    oldValue: currentBalance,
-                    newValue: 0,
-                    difference: -currentBalance, // Negative for debt, positive for overpayment
-                    reason: reason,
-                    isReversed: false
+                  bookingId: booking.id,
+                  agentId: finalAgentId,
+                  type: 'FINAL_RECONCILIATION',
+                  amount: reconciliationAmount,
+                  commissionMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1)
                 }
-            });
+              });
+          }
+      }
 
-            // 3. Recalculate everything to ensure absolute accuracy
-            const totalInitial = (booking.initialPayments || []).reduce((sum, p) => sum + p.amount, 0);
-            const totalInstalments = (booking.instalments || []).reduce((sum, inst) => 
-                sum + (inst.payments || []).reduce((pSum, p) => pSum + p.amount, 0), 0);
-            const totalPayables = (booking.customerPayables || []).reduce((sum, cp) => 
-                sum + (cp.settlements || []).reduce((sSum, s) => sSum + s.amount, 0), 0);
-            
-            // Add existing amendments + the one we just created
-            const totalAdjustments = (booking.amendments || []).reduce((sum, am) => sum + am.difference, 0) + (-currentBalance);
+      return { updatedBooking, amendment };
+    });
 
-            const totalReceived = totalInitial + totalInstalments + totalPayables;
-            const newFinalBalance = (booking.revenue || 0) - totalReceived + totalAdjustments;
-
-            // 4. Update the Booking with the new math
-            const updatedBooking = await tx.booking.update({
-                where: { id: booking.id },
-                data: {
-                    balance: newFinalBalance,
-                    // If balance is zero, mark status as COMPLETED
-                    bookingStatus: Math.abs(newFinalBalance) < 0.01 ? 'COMPLETED' : booking.bookingStatus
-                }
-            });
-
-            return { updatedBooking, amendment };
-        }, { timeout: 10000 });
-
-        return apiResponse.success(res, result);
-    } catch (error) {
-        console.error('Write-off error:', error);
-        return apiResponse.error(res, error.message, 400);
-    }
+    return apiResponse.success(res, result);
+  } catch (error) {
+    console.error("Write-off Error:", error);
+    return apiResponse.error(res, error.message, 400);
+  }
 };
 
 const reverseAmendment = async (req, res) => {
@@ -4221,6 +4152,74 @@ const reverseAmendment = async (req, res) => {
     }
 };
 
+const updateCommissionMonth = async (req, res) => {
+  const { id } = req.params;
+  const { commissionMonth } = req.body;
+
+  try {
+    const updatedEntry = await prisma.commissionLedger.update({
+      where: { id: parseInt(id) },
+      data: {
+        commissionMonth: new Date(commissionMonth),
+      },
+    });
+
+    return apiResponse.success(res, updatedEntry);
+  } catch (error) {
+    console.error('Error updating commission month:', error);
+    return apiResponse.error(res, 'Failed to update month', 500);
+  }
+};
+
+// Function to fetch the ledger entries for the Agent Commissions page
+const getAgentCommissions = async (req, res) => {
+  const { month } = req.query;
+
+  try {
+    const startOfMonth = new Date(`${month}-01T00:00:00Z`);
+    const endOfMonth = new Date(startOfMonth);
+    endOfMonth.setMonth(endOfMonth.getMonth() + 1);
+
+    const entries = await prisma.commissionLedger.findMany({
+      where: {
+        commissionMonth: { gte: startOfMonth, lt: endOfMonth },
+      },
+      include: {
+        booking: {
+          select: {
+            folderNo: true,
+            paxName: true,
+            revenue: true,
+            paymentMethod: true,
+            prodCost: true,
+            commissionEntries: {
+              where: { type: 'INITIAL' },
+              select: { amount: true }
+            }
+          }
+        },
+        agent: { select: { firstName: true, lastName: true } }
+      },
+      orderBy: { createdAt: 'desc' },
+    });
+
+    const formattedEntries = entries.map(entry => {
+      const initialPaid = entry.booking.commissionEntries[0]?.amount || 0;
+      return {
+        ...entry,
+        initialPaid: entry.type === 'FINAL_RECONCILIATION' ? initialPaid : 0,
+      };
+    });
+
+    return apiResponse.success(res, formattedEntries);
+  } catch (error) {
+    console.error('Error fetching commissions:', error);
+    return apiResponse.error(res, 'Failed to fetch commissions', 500);
+  }
+};
+
+
+
 module.exports = {
   createPendingBooking,
   getPendingBookings,
@@ -4253,5 +4252,7 @@ module.exports = {
   updateCommissionAmount,
   getCustomerCreditNotes,
   writeOffBookingBalance,
-  reverseAmendment
+  reverseAmendment,
+  getAgentCommissions,
+  updateCommissionMonth
 };

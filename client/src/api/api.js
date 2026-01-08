@@ -478,3 +478,6 @@ export const writeOffBookingBalance = async (bookingId, data) => {
 export const reverseAmendment = async (amendmentId) => {
     return await api.post(`/bookings/amendments/${amendmentId}/reverse`);
 };
+
+export const getAgentCommissions = (month) => api.get(`/bookings/commissions/agent?month=${month}`);
+export const updateCommissionMonth = (id, data) => api.patch(`/bookings/commissions/${id}/month`, data);
