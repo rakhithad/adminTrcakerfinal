@@ -36,7 +36,8 @@ const {
   writeOffBookingBalance,
   reverseAmendment,
   getAgentCommissions,
-  updateCommissionMonth
+  updateCommissionMonth,
+  toggleCommissionSettlement
 } = require('../controllers/bookingController');
 
 
@@ -79,5 +80,7 @@ router.post('/:id/write-off', authenticateToken, writeOffBookingBalance);
 router.post('/amendments/:amendmentId/reverse', authenticateToken, reverseAmendment);
 router.get('/commissions/agent', authenticateToken, getAgentCommissions);
 router.patch('/commissions/:id/month', authenticateToken, updateCommissionMonth);
+router.patch('/commissions/:id/settle', authenticateToken, toggleCommissionSettlement);
+
 
 module.exports = router;

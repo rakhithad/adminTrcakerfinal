@@ -6,7 +6,7 @@ import SelectCreditNotesPopup from './SelectCreditNotesPopup'; // Import the cre
 export default function SettlePaymentPopup({ booking, supplier, onClose, onSubmit }) {
   const [formData, setFormData] = useState({
     amount: '',
-    transactionMethod: 'BANK_TRANSFER', // Changed default to BANK_TRANSFER as it's common and in backend enum
+    transactionMethod: 'LOYDS', // Changed default to BANK_TRANSFER as it's common and in backend enum
     settlementDate: new Date().toISOString().split('T')[0],
     selectedCreditNotes: [], // NEW: State to hold selected notes for settlement
   });

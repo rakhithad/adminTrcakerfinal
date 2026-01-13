@@ -684,6 +684,7 @@ enum AmendmentType {
 model CommissionLedger {
   id              Int            @id @default(autoincrement())
   bookingId       Int            @map("booking_id")
+  folderNo        String?        @map("folder_no")
   booking         Booking        @relation(fields: [bookingId], references: [id], onDelete: Cascade)
   
   agentId         String         @map("agent_id")
@@ -705,4 +706,5 @@ model CommissionLedger {
 enum CommissionType {
   INITIAL
   FINAL_RECONCILIATION
+  CANCELLATION
 }

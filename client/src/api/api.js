@@ -481,3 +481,4 @@ export const reverseAmendment = async (amendmentId) => {
 
 export const getAgentCommissions = (month) => api.get(`/bookings/commissions/agent?month=${month}`);
 export const updateCommissionMonth = (id, data) => api.patch(`/bookings/commissions/${id}/month`, data);
+export const toggleCommissionSettlement = (id, data) => api.patch(`/bookings/commissions/${id}/settle`, data);
