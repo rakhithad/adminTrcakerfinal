@@ -679,6 +679,8 @@ enum AmendmentType {
   WRITE_OFF
   REVENUE_ADJUSTMENT
   REVERSAL
+  SUPPLIER_SETTLEMENT
+  SUPPLIER_PAYABLE_SETTLE
 }
 
 model CommissionLedger {
@@ -692,6 +694,7 @@ model CommissionLedger {
 
   type            CommissionType // INITIAL or FINAL_RECONCILIATION
   amount          Float          // The commission value (positive or negative)
+  description     String?
   
   // This is the month the commission is "Paid" in the reports
   commissionMonth DateTime       @map("commission_month") 
@@ -707,4 +710,5 @@ enum CommissionType {
   INITIAL
   FINAL_RECONCILIATION
   CANCELLATION
+  ADJUSTMENT
 }

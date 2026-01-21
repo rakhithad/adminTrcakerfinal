@@ -129,8 +129,11 @@ export default function AgentCommissions() {
             const res = await getAgentCommissions(selectedMonth);
             const ledger = res.data.data || [];
             setData({
+                // New bookings usually just have INITIAL or CANCELLATION fees
                 newBookings: ledger.filter(e => e.type === 'INITIAL' || e.type === 'CANCELLATION'),
-                settledBookings: ledger.filter(e => e.type === 'FINAL_RECONCILIATION')
+                
+                // ADD 'ADJUSTMENT' HERE
+                settledBookings: ledger.filter(e => e.type === 'FINAL_RECONCILIATION' || e.type === 'ADJUSTMENT')
             });
         } finally {
             setLoading(false);

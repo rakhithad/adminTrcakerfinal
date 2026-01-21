@@ -1,39 +1,74 @@
-const syncInitialCommission = async (tx, bookingId) => {
-    // 1. Fetch booking with current math
+// server/utils/commission.js
+
+const syncCommissionWithProfit = async (tx, bookingId) => {
+    // 1. Fetch booking
     const booking = await tx.booking.findUnique({
         where: { id: bookingId },
-        include: { commissionEntries: { where: { type: 'INITIAL' } } }
+        include: { 
+            commissionEntries: true,
+            costItems: { include: { suppliers: { include: { settlements: true } } } },
+            amendments: { where: { isReversed: false } }
+        }
     });
 
-    if (!booking || booking.bookingStatus === 'VOID') return;
+    if (!booking) return;
 
-    const profit = parseFloat(booking.revenue || 0) - parseFloat(booking.prodCost || 0);
-    
-    // Logic: 100% for FULL, 50% for INTERNAL
-    const targetAmount = booking.paymentMethod.includes('FULL') ? profit : (profit / 2);
-
-    if (booking.commissionEntries.length > 0) {
-        // Update existing row if not already locked by a final reconciliation
-        const hasFinal = await tx.commissionLedger.findFirst({
-            where: { bookingId, type: 'FINAL_RECONCILIATION' }
-        });
-
-        if (!hasFinal) {
-            await tx.commissionLedger.update({
-                where: { id: booking.commissionEntries[0].id },
-                data: { amount: targetAmount }
-            });
-        }
-    } else {
-        // Create new Initial row if it doesn't exist
-        await tx.commissionLedger.create({
-            data: {
-                bookingId: booking.id,
-                agentId: booking.agentId, // Ensure your booking model has agentId
-                type: 'INITIAL',
-                amount: targetAmount,
-                commissionMonth: booking.pcDate // Default to PC Date
+    // --- Resolve Agent ID ---
+    let finalAgentId = booking.agentId;
+    if (!finalAgentId && booking.agentName) {
+        const agentUser = await tx.user.findFirst({
+            where: { 
+                OR: [
+                    { firstName: { contains: booking.agentName.split(' ')[0], mode: 'insensitive' } },
+                    { lastName: { contains: booking.agentName.split(' ')[0], mode: 'insensitive' } }
+                ]
             }
         });
+        finalAgentId = agentUser?.id;
     }
+    if (!finalAgentId) return;
+
+    // 2. Determine Cost
+    const totalSupplierCosts = booking.costItems.reduce((acc, ci) => {
+        return acc + ci.suppliers.reduce((sAcc, s) => sAcc + (s.amount || 0), 0);
+    }, 0);
+
+    const costToUse = (booking.prodCost !== null && booking.prodCost !== undefined) 
+        ? parseFloat(booking.prodCost) 
+        : totalSupplierCosts;
+
+    // 3. Calculate "Amendment Impact"
+    const amendmentImpact = booking.amendments.reduce((sum, am) => sum + (am.difference || 0), 0);
+    
+    // 4. Calculate Effective Profit
+    const originalProfit = (parseFloat(booking.revenue) || 0) - costToUse - (booking.transFee || 0) - (booking.surcharge || 0);
+    const effectiveProfit = originalProfit + amendmentImpact;
+
+    // 5. Calculate what has already been paid
+    const alreadyPaidToAgent = booking.commissionEntries.reduce((sum, entry) => sum + entry.amount, 0);
+
+    // 6. Determine Target Commission
+    const paymentMethod = booking.paymentMethod || '';
+    const isFullProfit = paymentMethod.includes('FULL') || paymentMethod.includes('INTERNAL');
+
+    const targetCommission = isFullProfit ? effectiveProfit : (effectiveProfit / 2);
+
+    const adjustmentNeeded = targetCommission - alreadyPaidToAgent;
+
+    // 7. Create Adjustment Entry (ALWAYS, even if 0)
+    // I removed the "if (Math.abs(adjustmentNeeded) >= 0.01)" check.
+    await tx.commissionLedger.create({
+        data: {
+            bookingId: booking.id,
+            agentId: finalAgentId,
+            folderNo: booking.folderNo,
+            type: 'ADJUSTMENT', 
+            amount: adjustmentNeeded, // This will store 0
+            commissionMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
+            // Explicitly stating the logic in the description helps the user understand WHY it is 0
+            description: `Reconciliation: Profit ${effectiveProfit.toFixed(2)} vs Paid ${alreadyPaidToAgent.toFixed(2)}`
+        }
+    });
 };
+
+module.exports = { syncCommissionWithProfit };

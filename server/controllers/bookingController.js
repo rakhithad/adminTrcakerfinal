@@ -3,6 +3,7 @@ const apiResponse = require('../utils/apiResponse');
 const { generateNextInvoiceNumber } = require('../utils/invoiceService');
 const { createInvoicePdf } = require('../utils/pdfService');
 const { createAuditLog, ActionType } = require('../utils/auditLogger');
+const { syncCommissionWithProfit } = require('../utils/commission');
 
 const prisma = new PrismaClient();
 
@@ -1509,18 +1510,16 @@ const getCustomerDeposits = async (req, res) => {
 
 const createSupplierPaymentSettlement = async (req, res) => {
   const { id: userId } = req.user;
-  // Destructure selectedCreditNotes from the body
-  const { costItemSupplierId, amount, transactionMethod, settlementDate, selectedCreditNotes } = req.body;
+  const { costItemSupplierId, amount, transactionMethod, settlementDate, selectedCreditNotes, isWriteOff, reason } = req.body;
 
   try {
-    const parsedAmount = parseFloat(amount);
+    const parsedAmount = parseFloat(amount || 0);
 
-    // 1. Initial Validation
-    if (!costItemSupplierId || isNaN(parsedAmount) || parsedAmount <= 0 || !transactionMethod || !settlementDate) {
+    if (!costItemSupplierId || isNaN(parsedAmount) || parsedAmount < 0 || !transactionMethod || !settlementDate) {
       return apiResponse.error(res, 'Missing or invalid required fields', 400);
     }
 
-    // Validate Credit Note Payload
+    // Validate Credit Notes
     if (transactionMethod === 'CREDIT_NOTES') {
         if (!selectedCreditNotes || !Array.isArray(selectedCreditNotes) || selectedCreditNotes.length === 0) {
             return apiResponse.error(res, 'Credit Notes method selected but no notes provided', 400);
@@ -1532,8 +1531,8 @@ const createSupplierPaymentSettlement = async (req, res) => {
       return apiResponse.error(res, `Invalid transactionMethod.`, 400);
     }
 
-    const { newSettlement, updatedCostItemSupplier, updatedBooking } = await prisma.$transaction(async (tx) => {
-      // 2. Fetch CostItemSupplier
+    const result = await prisma.$transaction(async (tx) => {
+      // 1. Fetch Data
       const costItemSupplier = await tx.costItemSupplier.findUnique({
         where: { id: parseInt(costItemSupplierId) },
         include: {
@@ -1557,41 +1556,27 @@ const createSupplierPaymentSettlement = async (req, res) => {
 
       const currentBooking = costItemSupplier.costItem.booking;
       const pendingAmount = parseFloat(costItemSupplier.pendingAmount ?? 0) || 0;
+      const oldPaid = parseFloat(costItemSupplier.paidAmount || 0);
+      const oldAmount = parseFloat(costItemSupplier.amount || 0);
 
-      if (parsedAmount > pendingAmount + 0.01) {
+      if (!isWriteOff && parsedAmount > pendingAmount + 0.01) {
         throw new Error(`Amount exceeds pending amount`);
       }
 
-      // --- NEW LOGIC START: Process Credit Notes ---
+      // 2. Process Credit Notes
       if (transactionMethod === 'CREDIT_NOTES') {
-        // Iterate through each selected note sent from frontend
         for (const note of selectedCreditNotes) {
-            // 1. Deduct balance from the Credit Note
             const updatedNote = await tx.supplierCreditNote.update({
                 where: { id: note.id },
-                data: {
-                    remainingAmount: { decrement: note.amountToUse }
-                }
+                data: { remainingAmount: { decrement: note.amountToUse } }
             });
 
-            // 2. Check if we need to update status (USED vs PARTIALLY_USED)
-            // Use a small epsilon (0.01) for float comparison
             if (updatedNote.remainingAmount <= 0.01) {
-                await tx.supplierCreditNote.update({
-                    where: { id: note.id },
-                    data: { 
-                        status: 'USED',
-                        remainingAmount: 0 // Clean up float dust
-                    }
-                });
+                await tx.supplierCreditNote.update({ where: { id: note.id }, data: { status: 'USED', remainingAmount: 0 } });
             } else {
-                await tx.supplierCreditNote.update({
-                    where: { id: note.id },
-                    data: { status: 'PARTIALLY_USED' }
-                });
+                await tx.supplierCreditNote.update({ where: { id: note.id }, data: { status: 'PARTIALLY_USED' } });
             }
 
-            // 3. Create the Usage Record (Link Note to CostItemSupplier)
             await tx.creditNoteUsage.create({
                 data: {
                     creditNoteId: note.id,
@@ -1602,9 +1587,8 @@ const createSupplierPaymentSettlement = async (req, res) => {
             });
         }
       }
-      // --- NEW LOGIC END ---
 
-      // 3. Create Settlement Record (Keeps your financial history clean)
+      // 3. Create Settlement
       const createdSettlement = await tx.supplierPaymentSettlement.create({
         data: {
           costItemSupplierId: parseInt(costItemSupplierId),
@@ -1614,67 +1598,85 @@ const createSupplierPaymentSettlement = async (req, res) => {
         },
       });
 
-      // 4. Update CostItemSupplier Stats
-      const newPaidAmountForSupplier = (parseFloat(costItemSupplier.paidAmount ?? 0) || 0) + parsedAmount;
-      const newPendingAmountForSupplier = pendingAmount - parsedAmount;
+      // 4. Update Supplier Cost Item
+      const newPaid = oldPaid + parsedAmount;
+      // If WriteOff: New Amount = Paid Amount (we lower the cost to match what we paid).
+      // If Normal: Amount stays same.
+      const newAmount = isWriteOff ? newPaid : oldAmount; 
+      const newPending = isWriteOff ? 0 : (oldAmount - newPaid);
 
       const finalUpdatedSupplier = await tx.costItemSupplier.update({
         where: { id: parseInt(costItemSupplierId) },
         data: {
-          paidAmount: newPaidAmountForSupplier,
-          pendingAmount: newPendingAmountForSupplier,
-        },
-        include: { settlements: true },
+          amount: newAmount, // Updates Cost if WriteOff
+          paidAmount: newPaid,
+          pendingAmount: newPending
+        }
       });
 
-      // 5. Recalculate Booking Financials (Your existing logic)
-      const sumOfInitialPayments = (currentBooking.initialPayments || []).reduce((sum, p) => sum + p.amount, 0);
-      const sumOfInstalmentPayments = (currentBooking.instalments || []).reduce((sum, inst) =>
-        sum + (inst.payments || []).reduce((pSum, p) => pSum + p.amount, 0), 0);
-      const sumOfCustomerPayableSettlements = (currentBooking.customerPayables || []).reduce((sum, payable) =>
-        sum + (payable.settlements || []).reduce((sSum, s) => sSum + s.amount, 0), 0);
+      // 5. Log Amendment (ONLY FOR WRITE_OFF as requested)
+      if (isWriteOff) {
+        await tx.bookingAmendment.create({
+          data: {
+            bookingId: currentBooking.id,
+            userId: userId,
+            type: 'WRITE_OFF',
+            propertyName: `Supplier: ${costItemSupplier.supplier}`,
+            oldValue: oldAmount,
+            newValue: newAmount,
+            difference: oldAmount - newAmount,
+            reason: reason || "Balance cleared via write-off"
+          }
+        });
+      }
 
-      const totalReceivedFromCustomer = sumOfInitialPayments + sumOfInstalmentPayments + sumOfCustomerPayableSettlements;
+      // 6. Recalculate Booking Financials
+      // Calculate Total Paid to Suppliers
+      const totalPaidToSuppliers = (currentBooking.costItems || []).reduce((ciSum, ci) => 
+        ciSum + (ci.suppliers || []).reduce((sSum, s) => {
+             // Use the NEW values for the current supplier
+             if (s.id === parseInt(costItemSupplierId)) return sSum + newPaid; 
+             return sSum + (s.paidAmount || 0);
+        }, 0), 0);
 
-      const totalPaidToSuppliers = (currentBooking.costItems || []).reduce((ciSum, costItem) =>
-        ciSum + (costItem.suppliers || []).reduce((sSum, supplier) =>
-          sSum + (supplier.settlements || []).reduce((setSum, settlement) => setSum + settlement.amount, 0), 0), 0);
+      // Recalculate Total Cost (Amount) for Profit Calculation
+      // If we did a write-off, the cost decreased. We need to sum the 'amount' column.
+      const totalSupplierCostAmount = (currentBooking.costItems || []).reduce((ciSum, ci) => 
+        ciSum + (ci.suppliers || []).reduce((sSum, s) => {
+             if (s.id === parseInt(costItemSupplierId)) return sSum + newAmount;
+             return sSum + (s.amount || 0);
+        }, 0), 0);
 
-      const newProfit = (currentBooking.revenue ?? 0) - totalPaidToSuppliers - (currentBooking.transFee ?? 0) - (currentBooking.surcharge ?? 0);
-      const newBalance = (currentBooking.revenue ?? 0) - totalReceivedFromCustomer;
+      const sumOfInitial = (currentBooking.initialPayments || []).reduce((s, p) => s + p.amount, 0);
+      const sumOfInstalments = (currentBooking.instalments || []).reduce((s, i) => s + (i.payments || []).reduce((ps, p) => ps + p.amount, 0), 0);
+      const sumOfPayables = (currentBooking.customerPayables || []).reduce((s, cp) => s + (cp.settlements || []).reduce((ss, s) => ss + s.amount, 0), 0);
+      const totalReceived = sumOfInitial + sumOfInstalments + sumOfPayables;
 
-      // 6. Update Booking
+      // Profit = Revenue - Total Cost
+      const newProfit = (currentBooking.revenue || 0) - totalSupplierCostAmount - (currentBooking.transFee || 0) - (currentBooking.surcharge || 0);
+      const newBalance = (currentBooking.revenue || 0) - totalReceived;
+
       const updatedBookingRecord = await tx.booking.update({
         where: { id: currentBooking.id },
         data: {
           balance: newBalance,
           profit: newProfit,
+          prodCost: totalSupplierCostAmount, // Update prodCost in DB
           lastPaymentDate: new Date(settlementDate),
         }
       });
 
-      // 7. Audit Logs
-      await createAuditLog(tx, {
-        userId,
-        modelName: 'CostItemSupplier',
-        recordId: costItemSupplier.id,
-        action: ActionType.SETTLEMENT_PAYMENT,
-        changes: [{
-          fieldName: 'supplierPaid',
-          oldValue: `Paid: ${(costItemSupplier.paidAmount ?? 0).toFixed(2)}`,
-          newValue: `Paid: ${newPaidAmountForSupplier.toFixed(2)} (Settlement via ${transactionMethod})`
-        }]
-      });
+      // 7. Sync Commission
+      await syncCommissionWithProfit(tx, currentBooking.id);
 
-      return { newSettlement: createdSettlement, updatedCostItemSupplier: finalUpdatedSupplier, updatedBooking: updatedBookingRecord };
+      return { newSettlement, updatedCostItemSupplier: finalUpdatedSupplier, updatedBooking: updatedBookingRecord };
     }, {
       timeout: 10000
     });
 
-    return apiResponse.success(res, { newSettlement, updatedCostItemSupplier, updatedBooking }, 201);
+    return apiResponse.success(res, result, 201);
   } catch (error) {
     console.error('Error creating supplier payment settlement:', error);
-    // ... existing error handlers
     return apiResponse.error(res, `Failed: ${error.message}`, 500);
   }
 };
@@ -2984,31 +2986,21 @@ const createDateChangeBooking = async (req, res) => {
 
 const createSupplierPayableSettlement = async (req, res) => {
     const { id: userId } = req.user;
-    const { payableId, amount, transactionMethod, settlementDate } = req.body;
+    const { payableId, amount, transactionMethod, settlementDate, isWriteOff, reason } = req.body;
 
     try {
         const paymentAmount = parseFloat(amount);
 
-        // 1. Validation
-        if (!payableId) {
-            return apiResponse.error(res, 'Missing payableId', 400);
+        if (!payableId || isNaN(paymentAmount) || paymentAmount < 0) {
+            return apiResponse.error(res, 'Invalid input data', 400);
         }
-        if (isNaN(paymentAmount) || paymentAmount <= 0) {
-            return apiResponse.error(res, 'Amount must be a positive number', 400);
-        }
-        if (!transactionMethod || !settlementDate) {
-            return apiResponse.error(res, 'Missing transactionMethod or settlementDate', 400);
-        }
-        if (isNaN(new Date(settlementDate).getTime())) {
-            return apiResponse.error(res, 'Invalid settlement date', 400);
-        }
-        const validTransactionMethods = ['LOYDS', 'STRIPE', 'WISE', 'HUMM', 'CREDIT_NOTES', 'CREDIT', 'BANK_TRANSFER']; // Added BANK_TRANSFER from schema
+
+        const validTransactionMethods = ['LOYDS', 'STRIPE', 'WISE', 'HUMM', 'CREDIT_NOTES', 'CREDIT', 'BANK_TRANSFER'];
         if (!validTransactionMethods.includes(transactionMethod)) {
-          return apiResponse.error(res, `Invalid transactionMethod. Must be one of: ${validTransactionMethods.join(', ')}`, 400);
+          return apiResponse.error(res, `Invalid transactionMethod.`, 400);
         }
 
         const result = await prisma.$transaction(async (tx) => {
-            // 2. Fetch the SupplierPayable and its full chain to the Booking for comprehensive recalculation and logging
             const payable = await tx.supplierPayable.findUnique({
                 where: { id: parseInt(payableId) },
                 include: {
@@ -3016,33 +3008,31 @@ const createSupplierPayableSettlement = async (req, res) => {
                         include: {
                             originalBooking: {
                                 include: {
+                                    commissionEntries: true, // Needed for sync
                                     initialPayments: true,
                                     instalments: { include: { payments: true } },
                                     customerPayables: { include: { settlements: true } },
-                                    costItems: { include: { suppliers: { include: { settlements: true } } } }, // Deep include for all supplier settlements
+                                    costItems: { include: { suppliers: { include: { settlements: true } } } },
                                 }
                             }
                         }
                     },
-                    settlements: true // Include existing settlements for this payable
+                    settlements: true
                 }
             });
 
-            if (!payable) {
-                throw new Error('Supplier Payable record not found.');
-            }
-            if (!payable.createdFromCancellation?.originalBooking) {
-                throw new Error('Could not find the original booking related to this payable.');
-            }
+            if (!payable) throw new Error('Supplier Payable record not found.');
             const currentBooking = payable.createdFromCancellation.originalBooking;
 
             const pendingAmount = parseFloat(payable.pendingAmount) || 0;
-            if (paymentAmount > pendingAmount + 0.01) { // Add tolerance for floating-point issues
-                throw new Error(`Settlement amount (£${paymentAmount.toFixed(2)}) exceeds pending amount (£${pendingAmount.toFixed(2)})`);
+            const oldPaid = parseFloat(payable.paidAmount) || 0;
+            const oldTotal = parseFloat(payable.totalAmount) || 0;
+
+            if (!isWriteOff && paymentAmount > pendingAmount + 0.01) {
+                throw new Error(`Settlement amount exceeds pending amount`);
             }
 
-            // 3. Create the new settlement history record
-            const newPayableSettlement = await tx.supplierPayableSettlement.create({
+            await tx.supplierPayableSettlement.create({
                 data: {
                     supplierPayableId: parseInt(payableId),
                     amount: paymentAmount,
@@ -3051,115 +3041,81 @@ const createSupplierPayableSettlement = async (req, res) => {
                 },
             });
 
-            // 4. Update the parent SupplierPayable record's amounts and status
-            const newPaidAmountForPayable = (parseFloat(payable.paidAmount) || 0) + paymentAmount;
-            const newPendingAmountForPayable = pendingAmount - paymentAmount;
+            const newPaid = oldPaid + paymentAmount;
+            const newTotal = isWriteOff ? newPaid : oldTotal; // Write-off adjusts the Total Obligation down
+            const newPending = isWriteOff ? 0 : (oldTotal - newPaid);
             
             const updatedPayableRecord = await tx.supplierPayable.update({
                 where: { id: parseInt(payableId) },
                 data: {
-                    paidAmount: newPaidAmountForPayable,
-                    pendingAmount: newPendingAmountForPayable,
-                    status: newPendingAmountForPayable < 0.01 ? 'PAID' : 'PENDING',
-                },
-                include: { settlements: true } // Include settlements for return object
+                    totalAmount: newTotal,
+                    paidAmount: newPaid,
+                    pendingAmount: newPending,
+                    status: newPending < 0.01 ? 'PAID' : 'PENDING',
+                }
             });
 
-            // 5. Recalculate Booking's comprehensive financial state
-            // --- Sum of all payments received from customer ---
-            const sumOfInitialPayments = (currentBooking.initialPayments || []).reduce((sum, p) => sum + p.amount, 0);
-            const sumOfInstalmentPayments = (currentBooking.instalments || []).reduce((sum, inst) => 
-                sum + (inst.payments || []).reduce((pSum, p) => pSum + p.amount, 0), 0);
-            const sumOfCustomerPayableSettlements = (currentBooking.customerPayables || []).reduce((sum, customerPayable) => 
-                sum + (customerPayable.settlements || []).reduce((sSum, s) => sSum + s.amount, 0), 0);
-            
-            const totalReceivedFromCustomer = sumOfInitialPayments + sumOfInstalmentPayments + sumOfCustomerPayableSettlements;
+            // Log Amendment (ONLY FOR WRITE_OFF)
+            if (isWriteOff) {
+                await tx.bookingAmendment.create({
+                  data: {
+                    bookingId: currentBooking.id,
+                    userId: userId,
+                    type: 'WRITE_OFF',
+                    propertyName: `Payable: ${payable.supplier}`,
+                    oldValue: oldTotal,
+                    newValue: newTotal,
+                    difference: oldTotal - newTotal,
+                    reason: reason || "Shortfall write-off"
+                  }
+                });
+            }
 
-            // --- Sum of all payments made to ALL suppliers for ALL cost items and ALL supplier payables ---
-            // Re-fetch supplier payables to include the latest settlement
-            const allSupplierPayablesForBooking = await tx.supplierPayable.findMany({
-                where: { createdFromCancellation: { originalBookingId: currentBooking.id } },
-                include: { settlements: true }
+            // Recalculate Booking Financials
+            const sumOfInitial = (currentBooking.initialPayments || []).reduce((s, p) => s + p.amount, 0);
+            const sumOfInstalments = (currentBooking.instalments || []).reduce((s, i) => s + (i.payments || []).reduce((ps, p) => ps + p.amount, 0), 0);
+            const sumOfPayables = (currentBooking.customerPayables || []).reduce((s, cp) => s + (cp.settlements || []).reduce((ss, s) => ss + s.amount, 0), 0);
+            const totalReceived = sumOfInitial + sumOfInstalments + sumOfPayables;
+
+            const totalSupplierCostAmount = (currentBooking.costItems || []).reduce((ciSum, costItem) => 
+                ciSum + (costItem.suppliers || []).reduce((sSum, supplier) => sSum + (supplier.amount || 0), 0), 0);
+            
+            // Add Payables to "Cost" if they are considered part of the booking cost structure
+            // NOTE: Usually payables from cancellation are covered by retention, but if it affects profit:
+            const allPayables = await tx.supplierPayable.findMany({
+                where: { createdFromCancellation: { originalBookingId: currentBooking.id } }
             });
+            const totalPayablesAmount = allPayables.reduce((acc, p) => {
+                if (p.id === parseInt(payableId)) return acc + newTotal;
+                return acc + p.totalAmount;
+            }, 0);
 
-            const totalPaidViaSupplierPayables = (allSupplierPayablesForBooking || []).reduce((pSum, payable) => 
-                pSum + (payable.settlements || []).reduce((sSum, s) => sSum + s.amount, 0), 0);
-
-            const totalPaidViaCostItemSuppliers = (currentBooking.costItems || []).reduce((ciSum, costItem) => 
-                ciSum + (costItem.suppliers || []).reduce((sSum, supplier) => 
-                    sSum + (supplier.settlements || []).reduce((setSum, settlement) => setSum + settlement.amount, 0), 0), 0);
+            // Assuming Cancellation Payables reduce profit
+            const newProfit = (currentBooking.revenue || 0) - totalSupplierCostAmount - totalPayablesAmount - (currentBooking.transFee || 0);
+            const newBalance = (currentBooking.revenue || 0) - totalReceived;
             
-            const totalPaidToSuppliers = totalPaidViaCostItemSuppliers + totalPaidViaSupplierPayables;
-
-            // Calculate derived fields (profit, balance) based on the latest figures
-            const newProfit = (currentBooking.revenue || 0) - totalPaidToSuppliers - (currentBooking.transFee || 0) - (currentBooking.surcharge || 0);
-            const newBalance = (currentBooking.revenue || 0) - totalReceivedFromCustomer;
-            
-            // Store old booking balance and profit for audit log
-            const oldBookingBalance = currentBooking.balance;
-            const oldBookingProfit = currentBooking.profit;
-
-            // 6. Update the main Booking record with new financials
-            const updatedBookingRecord = await tx.booking.update({
+            await tx.booking.update({
                 where: { id: currentBooking.id },
                 data: {
                     balance: newBalance,
                     profit: newProfit,
-                    lastPaymentDate: new Date(settlementDate), // Consider if this should be last customer or last overall payment
+                    lastPaymentDate: new Date(settlementDate),
                 }
             });
 
-            // 7. Create Audit Logs
-            await createAuditLog(tx, {
-                userId,
-                modelName: 'SupplierPayable',
-                recordId: payable.id,
-                action: ActionType.SETTLEMENT_PAYMENT,
-                changes: [{
-                    fieldName: 'payableStatus',
-                    oldValue: payable.status,
-                    newValue: updatedPayableRecord.status
-                },
-                {
-                    fieldName: 'supplierPayableSettled',
-                    oldValue: `Pending: ${pendingAmount.toFixed(2)}`,
-                    newValue: `Paid: ${paymentAmount.toFixed(2)} (New Pending: ${newPendingAmountForPayable.toFixed(2)})`
-                }]
-            });
+            // Sync Commission
+            await syncCommissionWithProfit(tx, currentBooking.id);
 
-            await createAuditLog(tx, {
-                userId,
-                modelName: 'Booking',
-                recordId: currentBooking.id,
-                action: ActionType.SETTLEMENT_PAYMENT,
-                changes: [
-                    {
-                        fieldName: 'profit',
-                        oldValue: oldBookingProfit !== undefined ? oldBookingProfit.toFixed(2) : 'N/A',
-                        newValue: newProfit.toFixed(2)
-                    },
-                    {
-                        fieldName: 'balance',
-                        oldValue: oldBookingBalance !== undefined ? oldBookingBalance.toFixed(2) : 'N/A',
-                        newValue: newBalance.toFixed(2)
-                    }
-                ]
-            });
-
-            return { updatedPayable: updatedPayableRecord, updatedBooking: updatedBookingRecord };
+            return updatedPayableRecord;
         }, {
-            timeout: 10000 // Increase transaction timeout to 10 seconds
-        }); // End of prisma.$transaction
+            timeout: 10000
+        });
 
         return apiResponse.success(res, result, 201);
 
     } catch (error) {
-        console.error('Error creating supplier payable settlement:', error);
-        if (error.message.includes('not found')) return apiResponse.error(res, error.message, 404);
-        if (error.message.includes('exceeds pending amount')) return apiResponse.error(res, error.message, 400);
-        if (error.message.includes('Invalid')) return apiResponse.error(res, error.message, 400); // Catch explicit validation errors
-        if (error.name === 'PrismaClientValidationError') return apiResponse.error(res, `Invalid data provided: ${error.message}`, 400);
-        return apiResponse.error(res, `Failed to create payable settlement: ${error.message}`, 500);
+        console.error('Error creating payable settlement:', error);
+        return apiResponse.error(res, `Failed: ${error.message}`, 500);
     }
 };
 
@@ -3894,21 +3850,17 @@ const writeOffBookingBalance = async (req, res) => {
 
   try {
     const result = await prisma.$transaction(async (tx) => {
+      // 1. Fetch Basic Info
       const booking = await tx.booking.findUnique({
         where: { id: bookingId },
-        include: {
-          initialPayments: true,
-          instalments: { include: { payments: true } },
-          customerPayables: { include: { settlements: true } },
-          amendments: { where: { isReversed: false } },
-          commissionEntries: { where: { type: 'INITIAL' } }
-          // REMOVED: agent: true
-        }
+        select: { id: true, balance: true, bookingStatus: true } // Minimal select needed here
       });
 
       if (!booking) throw new Error('Booking not found');
       const currentBalance = parseFloat(booking.balance || 0);
 
+      // 2. Create the Amendment Record (This is your "History")
+      // We record the NEGATIVE difference so the math works later
       const amendment = await tx.bookingAmendment.create({
         data: {
           bookingId: booking.id,
@@ -3917,61 +3869,25 @@ const writeOffBookingBalance = async (req, res) => {
           propertyName: 'balance',
           oldValue: currentBalance,
           newValue: 0,
-          difference: -currentBalance,
+          difference: -currentBalance, // e.g., -50.00
           reason: reason
         }
       });
 
+      // 3. Update the Booking Balance (Visual only)
+      // We DO NOT touch 'revenue'. Revenue remains £1000.
       const updatedBooking = await tx.booking.update({
         where: { id: booking.id },
         data: {
           balance: 0,
-          bookingStatus: 'COMPLETED'
+          // Optional: Only mark completed if you want to close it entirely
+          bookingStatus: booking.bookingStatus === 'CONFIRMED' ? 'COMPLETED' : booking.bookingStatus 
         }
       });
 
-      const existingReconciliation = await tx.commissionLedger.findFirst({
-          where: { bookingId: booking.id, type: 'FINAL_RECONCILIATION' }
-      });
-
-      if (!existingReconciliation) {
-          const initialPaid = booking.commissionEntries[0]?.amount || 0;
-          
-          const totalIn = booking.initialPayments.reduce((s, p) => s + parseFloat(p.amount || 0), 0);
-          const totalInst = booking.instalments.reduce((s, i) => s + i.payments.reduce((ps, p) => ps + parseFloat(p.amount || 0), 0), 0);
-          const totalPay = booking.customerPayables.reduce((s, cp) => s + cp.settlements.reduce((ss, s) => ss + parseFloat(s.amount || 0), 0), 0);
-          const totalAdj = booking.amendments.reduce((s, a) => s + parseFloat(a.difference || 0), 0) + (-currentBalance);
-
-          const finalRevenue = parseFloat(booking.revenue || 0);
-          const finalProfit = (finalRevenue - parseFloat(booking.prodCost || 0)) + totalAdj;
-          const reconciliationAmount = finalProfit - initialPaid;
-
-          // Resolve Agent ID manually since the relation doesn't exist
-          let finalAgentId = booking.agentId;
-          if (!finalAgentId) {
-              const agentUser = await tx.user.findFirst({
-                  where: { 
-                    OR: [
-                        { firstName: { contains: booking.agentName.split(' ')[0], mode: 'insensitive' } },
-                        { id: userId } // Fallback to current user if name match fails
-                    ]
-                  }
-              });
-              finalAgentId = agentUser?.id;
-          }
-
-          if (finalAgentId && Math.abs(reconciliationAmount) > 0.01) {
-              await tx.commissionLedger.create({
-                data: {
-                  bookingId: booking.id,
-                  agentId: finalAgentId,
-                  type: 'FINAL_RECONCILIATION',
-                  amount: reconciliationAmount,
-                  commissionMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1)
-                }
-              });
-          }
-      }
+      // 4. Trigger Commission Reconciliation
+      // This will read the new amendment (-50) and adjust commission (-50)
+      await syncCommissionWithProfit(tx, booking.id);
 
       return { updatedBooking, amendment };
     });
@@ -4082,7 +3998,14 @@ const getAgentCommissions = async (req, res) => {
             revenue: true,
             paymentMethod: true,
             prodCost: true,
-            cancellation: { select: { adminFee: true } } // Include for display
+            cancellation: { select: { adminFee: true } },
+            // --- NEW: Fetch all commission entries for this booking ---
+            commissionEntries: {
+                select: {
+                    type: true,
+                    amount: true
+                }
+            }
           }
         },
         agent: { select: { firstName: true, lastName: true } }
@@ -4090,16 +4013,26 @@ const getAgentCommissions = async (req, res) => {
       orderBy: { createdAt: 'desc' },
     });
 
-    const formatted = entries.map(entry => ({
-      ...entry,
-      // Use displayRevenue: Admin Fee for cancellations, otherwise Booking Revenue
-      displayRevenue: entry.type === 'CANCELLATION' 
-        ? (entry.booking.cancellation?.adminFee || 0) 
-        : (entry.booking.revenue || 0)
-    }));
+    const formatted = entries.map(entry => {
+      // --- NEW: Calculate the sum of INITIAL payments for this booking ---
+      const initialPaidTotal = entry.booking.commissionEntries
+        .filter(e => e.type === 'INITIAL')
+        .reduce((sum, e) => sum + (e.amount || 0), 0);
+
+      return {
+        ...entry,
+        // Add the missing property so the Frontend can read it
+        initialPaid: initialPaidTotal, 
+        
+        displayRevenue: entry.type === 'CANCELLATION' 
+          ? (entry.booking.cancellation?.adminFee || 0) 
+          : (entry.booking.revenue || 0)
+      };
+    });
 
     return apiResponse.success(res, formatted);
   } catch (error) {
+    console.error("Commission Fetch Error:", error);
     return apiResponse.error(res, 'Failed to fetch commissions', 500);
   }
 };
