@@ -2651,45 +2651,67 @@ const createCancellation = async (req, res) => {
     const parsedAdminFee = parseFloat(adminFee || 0);
 
     const result = await prisma.$transaction(async (tx) => {
+      // 1. Fetch Trigger Booking (FIXED: Removed agentId from select)
       const triggerBooking = await tx.booking.findUnique({
           where: { id: parseInt(triggerBookingId) },
           select: { 
             id: true, 
             folderNo: true, 
             agentName: true, 
-            bookingStatus: true 
-            // REMOVED agentId: true because it does not exist in the Booking model
+            bookingStatus: true,
+            revenue: true,
+            prodCost: true,
+            paymentMethod: true,
+            // agentId: true, <--- REMOVED THIS LINE TO FIX CRASH
+            commissionEntries: true
           }
         });
 
       if (!triggerBooking) throw new Error('Booking not found.');
       if (triggerBooking.bookingStatus === 'CANCELLED') throw new Error('Booking already cancelled.');
 
+      // 2. Resolve Agent ID using Name (Since agentId doesn't exist on Booking)
+      let finalAgentId = null;
+      if (triggerBooking.agentName) {
+        const agentUser = await tx.user.findFirst({
+            where: { 
+                OR: [
+                    { firstName: { contains: triggerBooking.agentName.split(' ')[0], mode: 'insensitive' } },
+                    { lastName: { contains: triggerBooking.agentName.split(' ')[0], mode: 'insensitive' } }
+                ]
+            }
+        });
+        finalAgentId = agentUser?.id;
+      }
+
       const baseFolderNo = triggerBooking.folderNo.toString().split('.')[0];
       const cancellationFolderNo = `${baseFolderNo}.C`;
 
+      // 3. Fetch Chain Bookings
       const chainBookings = await tx.booking.findMany({
         where: { OR: [{ folderNo: baseFolderNo }, { folderNo: { startsWith: `${baseFolderNo}.` } }] },
         include: {
           initialPayments: true,
           instalments: { include: { payments: true } },
-          costItems: { include: { suppliers: true } }
+          costItems: { include: { suppliers: true } },
+          commissionEntries: true,
+          customerPayables: { include: { settlements: true } } // Ensure this relation is included for calculation
         },
       });
 
       const rootBookingInChain = chainBookings.find(b => b.folderNo === baseFolderNo);
       if (!rootBookingInChain) throw new Error('Could not find root booking in chain.');
 
+      // 4. Calculate Totals ("The Golden Formula")
       const totalChainReceived = chainBookings.reduce((sum, b) => {
         const initial = (b.initialPayments || []).reduce((acc, p) => acc + p.amount, 0);
         const inst = (b.instalments || []).reduce((acc, i) => acc + (i.payments || []).reduce((pa, p) => pa + p.amount, 0), 0);
-        return sum + initial + inst;
-      }, 0);
-
-      const totalPaidToSupplier = chainBookings.reduce((sum, b) => {
-          return sum + (b.costItems || []).reduce((ciSum, item) => {
-              return ciSum + (item.suppliers || []).reduce((sSum, sup) => sSum + (sup.paidAmount || 0), 0);
-          }, 0);
+        // Calculate settlements from payables safely
+        const payableSettlements = (b.customerPayables || []).reduce((acc, cp) => {
+            return acc + (cp.settlements || []).reduce((s, pay) => s + pay.amount, 0);
+        }, 0);
+        
+        return sum + initial + inst + payableSettlements;
       }, 0);
 
       const customerDifference = totalChainReceived - (parsedSupplierCancellationFee + parsedAdminFee);
@@ -2697,6 +2719,11 @@ const createCancellation = async (req, res) => {
       
       const originalProdCost = chainBookings.reduce((sum, b) => sum + (b.prodCost || 0), 0);
 
+      // Profit = Received - Refund - SupplierFee
+      const netSupplierCost = parsedSupplierCancellationFee; 
+      const trueProfit = totalChainReceived - refundToPassenger - netSupplierCost;
+
+      // 5. Create Cancellation Record
       const newCancellationRecord = await tx.cancellation.create({
         data: {
           originalBookingId: rootBookingInChain.id,
@@ -2706,28 +2733,57 @@ const createCancellation = async (req, res) => {
           supplierCancellationFee: parsedSupplierCancellationFee,
           adminFee: parsedAdminFee,
           refundToPassenger: refundToPassenger,
-          refundStatus: refundToPassenger > 0 ? 'CREDIT_ISSUED' : 'N/A',
-          profitOrLoss: 0,
+          refundStatus: refundToPassenger > 0 ? 'PENDING' : 'N/A', 
+          profitOrLoss: trueProfit,
           description: `Cancellation for chain ${baseFolderNo}.`,
           accountingMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
         },
       });
 
-      const cancellationProfit = parsedAdminFee - parsedSupplierCancellationFee;
-      
-      if (Math.abs(cancellationProfit) > 0.01) {
-          await tx.commissionLedger.create({
-              data: {
-                  bookingId: rootBookingInChain.id,
-                  agentId: userId, // Using the authenticated User ID from req.user
-                  folderNo: cancellationFolderNo, 
-                  type: 'CANCELLATION',
-                  amount: cancellationProfit, 
-                  commissionMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1)
-              }
-          });
+      // 6. Handle Debt (If customer still owes money)
+      if (refundToPassenger <= 0 && customerDifference < 0) {
+          const debtAmount = Math.abs(customerDifference);
+          if (debtAmount > 0.01) {
+              await tx.customerPayable.create({
+                  data: {
+                      createdFromCancellationId: newCancellationRecord.id,
+                      bookingId: rootBookingInChain.id,
+                      totalAmount: debtAmount,
+                      pendingAmount: debtAmount,
+                      reason: 'Outstanding balance after cancellation fees',
+                      status: 'PENDING'
+                  }
+              });
+          }
       }
 
+      // 7. Commission Reconciliation
+      const alreadyPaidToAgent = chainBookings.reduce((total, b) => {
+          return total + (b.commissionEntries || []).reduce((sum, entry) => sum + entry.amount, 0);
+      }, 0);
+
+      const paymentMethod = triggerBooking.paymentMethod || '';
+      const isFullProfit = paymentMethod.includes('FULL') || paymentMethod.includes('INTERNAL');
+      const targetCommission = isFullProfit ? trueProfit : (trueProfit / 2);
+
+      const adjustmentNeeded = targetCommission - alreadyPaidToAgent;
+
+      if (Math.abs(adjustmentNeeded) >= 0.01) {
+        await tx.commissionLedger.create({
+            data: {
+                bookingId: rootBookingInChain.id,
+                agentId: finalAgentId || userId, 
+                folderNo: cancellationFolderNo, 
+                type: 'CANCELLATION',
+                amount: adjustmentNeeded, 
+                commissionMonth: new Date(new Date().getFullYear(), new Date().getMonth(), 1),
+                isSettled: false, 
+                description: `Cancellation Reconciliation: Profit ${trueProfit.toFixed(2)} - Paid ${alreadyPaidToAgent.toFixed(2)}`
+            }
+        });
+      }
+
+      // 8. Update Status
       await tx.booking.updateMany({ 
         where: { id: { in: chainBookings.map(b => b.id) } }, 
         data: { bookingStatus: 'CANCELLED' } 
@@ -2742,7 +2798,6 @@ const createCancellation = async (req, res) => {
     return apiResponse.error(res, error.message, 500);
   }
 };
-
 
 const getAvailableCreditNotes = async (req, res) => {
   try {
@@ -2782,7 +2837,6 @@ const getAvailableCreditNotes = async (req, res) => {
     return apiResponse.error(res, `Failed to fetch credit notes: ${error.message}`, 500);
   }
 };
-
 
 const createDateChangeBooking = async (req, res) => {
   const { id: userId } = req.user;
@@ -3118,7 +3172,6 @@ const createSupplierPayableSettlement = async (req, res) => {
         return apiResponse.error(res, `Failed: ${error.message}`, 500);
     }
 };
-
 
 const settleCustomerPayable = async (req, res) => {
     const { id: userId } = req.user;
